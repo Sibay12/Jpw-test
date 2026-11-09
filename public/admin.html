@@ -5,6 +5,248 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>JPW Admin</title>
     <script src="https://cdn.tailwindcss.com"></script>
+<script>
+    // Multi-Gateway Routing settings
+    async function gwLoad() {
+        const msg = document.getElementById('gwMessage');
+        try {
+            const r = await fetch('/api/admin/gateway-routing', { headers: { 'x-admin-pass': adminPassCache }, cache: 'no-store' });
+            const d = await r.json(); if (!d.success) throw new Error(d.message || 'Could not load settings');
+            const c = d.config || {};
+            const mode = document.querySelector('input[name="gwMode"][value="' + (c.mode || 'telegram') + '"]');
+            if (mode) mode.checked = true;
+            document.getElementById('gwDispatch').value = c.dispatch || 'direct';
+            document.getElementById('gwBothStrategy').value = c.bothStrategy || 'parallel';
+            document.getElementById('gwTelegramEnabled').checked = c.telegramEnabled !== false;
+            document.getElementById('gwWhatsAppEnabled').checked = c.whatsappEnabled === true;
+            document.getElementById('gwWhatsAppTarget').value = c.whatsappTarget || '';
+            document.getElementById('gwPrimary').value = c.primaryGateway || 'telegram';
+            document.getElementById('gwFallback').value = c.fallbackGateway || 'whatsapp';
+            document.getElementById('gwFallbackEnabled').checked = c.fallbackEnabled === true;
+            document.getElementById('gwStatus').textContent = 'Configuration loaded';
+            if (msg) msg.textContent = 'Saved configuration loaded.';
+            if (typeof gwRulesLoad === 'function') gwRulesLoad();
+        } catch (e) { if (msg) msg.textContent = e.message; }
+    }
+    async function gwSave() {
+        const msg = document.getElementById('gwMessage');
+        const mode = document.querySelector('input[name="gwMode"]:checked');
+        const payload = {
+            mode: mode ? mode.value : 'telegram',
+            dispatch: document.getElementById('gwDispatch').value,
+            bothStrategy: document.getElementById('gwBothStrategy').value,
+            telegramEnabled: document.getElementById('gwTelegramEnabled').checked,
+            whatsappEnabled: document.getElementById('gwWhatsAppEnabled').checked,
+            whatsappTarget: document.getElementById('gwWhatsAppTarget').value.trim(),
+            primaryGateway: document.getElementById('gwPrimary').value,
+            fallbackGateway: document.getElementById('gwFallback').value,
+            fallbackEnabled: document.getElementById('gwFallbackEnabled').checked
+        };
+        try {
+            const r = await fetch('/api/admin/gateway-routing', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-admin-pass': adminPassCache }, body: JSON.stringify(payload) });
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Save failed');
+            if (msg) msg.textContent = 'Saved successfully. ' + d.message;
+            document.getElementById('gwStatus').textContent = 'Saved';
+        } catch (e) { if (msg) msg.textContent = 'Error: ' + e.message; }
+    }
+
+
+    function rpAddRow(channel, value = {}) {
+        const body=document.getElementById(channel==='web'?'rpWebRows':'rpBotRows');
+        if(!body || body.children.length>=30){alert('Maximum 30 packages per channel.');return;}
+        const rate=Number(document.getElementById(channel==='web'?'rpWebRate':'rpBotRate')?.value||0);
+        const nextReach=value.coins??value.reaches??(Math.max(0,...Array.from(body.querySelectorAll('[data-rp-reaches]')).map(x=>Number(x.value)||0))+1);
+        const amount=value.amount??Math.round(rate*nextReach);
+        const tr=document.createElement('tr');tr.className='border-b border-slate-800';
+        tr.innerHTML=`<td class="py-2 pr-2"><input data-rp-reaches type="number" min="1" max="100000" step="1" class="fld w-24" value="${Number(nextReach)}"></td>
+            <td class="py-2 pr-2"><input data-rp-amount type="number" min="1" max="10000000" step="1" class="fld w-28" value="${Number(amount)}"></td>
+            ${channel==='bot'?`<td class="py-2 pr-2"><input data-rp-commission type="number" min="0" max="1000" step="0.01" class="fld w-24" value="${Number(value.commission||0)}"></td>`:''}
+            <td class="py-2"><button type="button" class="btn btn-ghost btn-sm" onclick="this.closest('tr').remove()">Remove</button></td>`;
+        body.appendChild(tr);
+    }
+    function rpRender(channel, config) {
+        const rate=document.getElementById(channel==='web'?'rpWebRate':'rpBotRate');
+        const body=document.getElementById(channel==='web'?'rpWebRows':'rpBotRows');
+        if(rate)rate.value=Number(config?.perReachPrice||0);
+        if(body){body.innerHTML='';(config?.packages||[]).forEach(p=>rpAddRow(channel,p));}
+    }
+    async function rpLoad() {
+        const status=document.getElementById('rpStatus');
+        try{
+            if(status)status.textContent='Loading saved package prices…';
+            const r=await fetch('/api/admin/reach-pricing',{headers:{'x-admin-pass':adminPassCache},cache:'no-store'});
+            const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Could not load pricing');
+            rpRender('web',d.pricing.web);rpRender('bot',d.pricing.bot);
+            if(status)status.textContent='Saved pricing loaded. Existing customer balances are not changed.';
+        }catch(e){if(status)status.textContent='Pricing load error: '+e.message;}
+    }
+    function rpCollect(channel) {
+        const rate=Number(document.getElementById(channel==='web'?'rpWebRate':'rpBotRate').value);
+        const body=document.getElementById(channel==='web'?'rpWebRows':'rpBotRows');
+        const packages=Array.from(body.querySelectorAll('tr')).map(tr=>({
+            coins:Number(tr.querySelector('[data-rp-reaches]').value),
+            amount:Number(tr.querySelector('[data-rp-amount]').value),
+            ...(channel==='bot'?{commission:Number(tr.querySelector('[data-rp-commission]').value)}:{})
+        }));
+        return {perReachPrice:rate,packages};
+    }
+    async function rpSave() {
+        const status=document.getElementById('rpStatus');
+        try{
+            const payload={web:rpCollect('web'),bot:rpCollect('bot')};
+            for(const [name,cfg] of Object.entries(payload)){
+                if(!Number.isFinite(cfg.perReachPrice)||cfg.perReachPrice<=0)throw new Error(name+': enter a valid per-Reach price.');
+                if(!cfg.packages.length||cfg.packages.length>30)throw new Error(name+': add 1–30 packages.');
+                const seen=new Set();
+                for(const p of cfg.packages){
+                    if(!Number.isSafeInteger(p.coins)||p.coins<1||p.coins>100000)throw new Error(name+': Reach quantity must be a finite whole number.');
+                    if(!Number.isSafeInteger(p.amount)||p.amount<1||p.amount>10000000)throw new Error(name+': package price must be a positive whole INR amount.');
+                    if(seen.has(p.coins))throw new Error(name+': duplicate Reach quantity '+p.coins+'.');
+                    seen.add(p.coins);
+                }
+            }
+            if(status)status.textContent='Saving pricing…';
+            const r=await fetch('/api/admin/reach-pricing',{method:'POST',headers:{'Content-Type':'application/json','x-admin-pass':adminPassCache},body:JSON.stringify(payload)});
+            const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Save failed');
+            rpRender('web',d.pricing.web);rpRender('bot',d.pricing.bot);
+            if(status)status.textContent='Saved. New prices apply to future purchases; existing paid balances remain unchanged.';
+        }catch(e){if(status)status.textContent='Not saved: '+e.message;}
+    }
+
+    async function saasLoadTenants() {
+        const status = document.getElementById('saasStatus'), body = document.getElementById('saasTenantBody');
+        try {
+            if (status) status.textContent = 'Loading tenant accounts…';
+            const r = await fetch('/api/admin/saas/tenants', {headers:{'x-admin-pass':adminPassCache},cache:'no-store'});
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Could not load tenants');
+            const rows=d.tenants||[];
+            if(body) body.innerHTML=rows.length?rows.map(t=>`<tr class="border-b border-slate-800 align-top">
+                <td class="py-3 pr-3"><b>${tlEsc(t.name)}</b><div class="text-slate-500">${tlEsc(t.slug)}</div><div class="text-slate-500 text-[10px]">${tlEsc(t.tenantId)}</div></td>
+                <td class="py-3 pr-3">${tlEsc(t.ownerEmail)}</td><td class="py-3 pr-3">${tlEsc(t.plan)}</td><td class="py-3 pr-3">${tlEsc(t.status)}</td>
+                <td class="py-3 pr-3">${t.currentPeriodEnd?tlEsc(new Date(t.currentPeriodEnd).toLocaleDateString()):'—'}</td>
+                <td class="py-3 pr-3">${Number(t.limits?.maxUsers||0)} users<br>${Number(t.limits?.maxOrdersPerMonth||0)} orders/mo</td>
+                <td class="py-3"><div class="flex flex-wrap gap-1">
+                <button class="btn btn-ghost btn-sm" onclick="saasChangeTenant('${tlEsc(t.tenantId)}','active')">Activate</button>
+                <button class="btn btn-ghost btn-sm" onclick="saasChangeTenant('${tlEsc(t.tenantId)}','suspended')">Suspend</button>
+                <button class="btn btn-ghost btn-sm" onclick="saasChangePlan('${tlEsc(t.tenantId)}')">Change plan</button>
+                <button class="btn btn-ghost btn-sm" onclick="saasRotateKey('${tlEsc(t.tenantId)}')">Rotate key</button></div></td></tr>`).join(''):'<tr><td colspan="7" class="py-4 text-slate-500">No tenant accounts created yet.</td></tr>';
+            if(status) status.textContent=`${rows.length} tenant account(s) registered.`;
+        } catch(e) { if(status) status.textContent='Error: '+e.message; }
+    }
+    async function saasCreateTenant() {
+        const msg=document.getElementById('saasCreateMessage');
+        const payload={name:document.getElementById('saasName').value.trim(),slug:document.getElementById('saasSlug').value.trim(),
+            ownerName:document.getElementById('saasOwnerName').value.trim(),ownerEmail:document.getElementById('saasOwnerEmail').value.trim(),
+            plan:document.getElementById('saasPlan').value,trialDays:Number(document.getElementById('saasTrialDays').value||14)};
+        try {
+            const r=await fetch('/api/admin/saas/tenants',{method:'POST',headers:{'Content-Type':'application/json','x-admin-pass':adminPassCache},body:JSON.stringify(payload)});
+            const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Tenant creation failed');
+            alert('Tenant created. Copy this API key now; it will not be shown again:\n\n'+d.tenantApiKey);
+            if(msg)msg.textContent='Tenant created. API key was displayed once.';
+            ['saasName','saasSlug','saasOwnerName','saasOwnerEmail'].forEach(id=>document.getElementById(id).value='');
+            await saasLoadTenants();
+        } catch(e){if(msg)msg.textContent='Error: '+e.message;}
+    }
+    async function saasChangeTenant(tenantId,status) {
+        if(!confirm('Change tenant status to '+status+'?'))return;
+        try {
+            const r=await fetch('/api/admin/saas/tenants/'+encodeURIComponent(tenantId),{method:'PATCH',
+                headers:{'Content-Type':'application/json','x-admin-pass':adminPassCache},body:JSON.stringify({status})});
+            const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Update failed');
+            await saasLoadTenants();
+        }catch(e){alert('Tenant update failed: '+e.message);}
+    }
+    async function saasChangePlan(tenantId) {
+        const plan = prompt('Enter plan: free, starter, growth, or business');
+        if (!plan) return;
+        if (!['free','starter','growth','business'].includes(plan.trim().toLowerCase())) { alert('Invalid plan.'); return; }
+        try {
+            const r=await fetch('/api/admin/saas/tenants/'+encodeURIComponent(tenantId),{method:'PATCH',
+                headers:{'Content-Type':'application/json','x-admin-pass':adminPassCache},body:JSON.stringify({plan:plan.trim().toLowerCase()})});
+            const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Plan update failed');
+            await saasLoadTenants();
+        } catch(e) { alert('Plan update failed: '+e.message); }
+    }
+    async function saasRotateKey(tenantId) {
+        if(!confirm('Rotate this tenant API key? The old key will stop working.'))return;
+        try {
+            const r=await fetch('/api/admin/saas/tenants/'+encodeURIComponent(tenantId)+'/rotate-key',{method:'POST',headers:{'x-admin-pass':adminPassCache}});
+            const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Key rotation failed');
+            alert('New tenant API key (copy now; shown once):\n\n'+d.tenantApiKey);
+        }catch(e){alert('Key rotation failed: '+e.message);}
+    }
+
+    async function gwQueueLoad() {
+        const status = document.getElementById('gwQueueStatus');
+        const body = document.getElementById('gwQueueBody');
+        try {
+            if (status) status.textContent = 'Loading queue…';
+            const r = await fetch('/api/admin/gateway-queue', { headers: { 'x-admin-pass': adminPassCache }, cache: 'no-store' });
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Could not load queue');
+            const s = d.stats || {}, stats = document.getElementById('gwQueueStats');
+            if (stats) stats.innerHTML = [['Queued',s.queued],['Processing',s.processing],['Retrying',s.retry],['Sent (24h)',s.sentLast24h],['Failed',s.failed]]
+                .map(x => `<div class="rounded-xl border border-slate-700 bg-slate-900/40 p-3"><div class="text-xs text-slate-400">${x[0]}</div><div class="text-xl font-bold">${Number(x[1]||0)}</div></div>`).join('');
+            const rows = d.jobs || [];
+            if (body) body.innerHTML = rows.length ? rows.map(j => `<tr class="border-b border-slate-800 align-top">
+                <td class="py-2 pr-3">${tlEsc(j.orderId)}</td><td class="py-2 pr-3">${tlEsc(j.targetId)}</td>
+                <td class="py-2 pr-3">${tlEsc(j.status)}</td><td class="py-2 pr-3">${j.position || '—'}</td>
+                <td class="py-2 pr-3">${j.etaSeconds ? Math.ceil(j.etaSeconds/60)+' min' : '—'}</td>
+                <td class="py-2 pr-3">${Number(j.attempts||0)}/${Number(j.maxAttempts||4)}</td>
+                <td class="py-2 pr-3 text-rose-300">${tlEsc(j.lastError||'—')}${j.refundReviewRequired ? '<div class="text-amber-300 mt-1">Refund review required</div>' : ''}</td>
+                <td class="py-2">${j.status==='failed' ? `<button class="btn btn-ghost btn-sm" onclick="gwQueueRetry('${tlEsc(j.id)}')">Retry</button>` : '—'}</td>
+            </tr>`).join('') : '<tr><td colspan="8" class="py-3 text-slate-500">No pending or failed queue jobs.</td></tr>';
+            if (status) status.textContent = 'FIFO queue refreshed. ETA uses an initial estimate of 25 seconds per order; actual wait varies with gateway response time.';
+        } catch(e) { if (status) status.textContent = 'Queue error: ' + e.message; }
+    }
+    async function gwQueueRetry(jobId) {
+        try {
+            const r = await fetch('/api/admin/gateway-queue/retry-failed', {
+                method: 'POST', headers: {'Content-Type':'application/json','x-admin-pass':adminPassCache},
+                body: JSON.stringify({ jobId })
+            });
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Retry failed');
+            await gwQueueLoad();
+        } catch(e) { alert('Could not retry queue job: ' + e.message); }
+    }
+
+    const gwDefaultRules = [
+        { id: 'success-default', enabled: true, keyword: 'status: success', matchMode: 'contains', classification: 'success_candidate', customerMessage: 'Your request for {targetId} has received a success update.', extractPattern: '', extractLabel: '' },
+        { id: 'failure-default', enabled: true, keyword: 'status: failed', matchMode: 'contains', classification: 'failure_candidate', customerMessage: 'There is an issue with your request for {targetId}. Our team will review it.', extractPattern: '', extractLabel: '' },
+        { id: 'progress-default', enabled: true, keyword: 'processing', matchMode: 'contains', classification: 'in_progress', customerMessage: 'Your request for {targetId} is currently being processed.', extractPattern: '', extractLabel: '' }
+    ];
+    async function gwRulesLoad() {
+        const msg = document.getElementById('gwRulesMessage');
+        try {
+            const r = await fetch('/api/admin/gateway-reply-rules', { headers: { 'x-admin-pass': adminPassCache }, cache: 'no-store' });
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Could not load reply rules');
+            const c = d.config || {};
+            document.getElementById('gwRulesEnabled').checked = c.enabled === true;
+            document.getElementById('gwNotifyCustomer').checked = c.notifyCustomer === true;
+            document.getElementById('gwRulesJson').value = JSON.stringify(Array.isArray(c.rules) ? c.rules : gwDefaultRules, null, 2);
+            if (msg) msg.textContent = 'Reply rules loaded.';
+        } catch (e) { if (msg) msg.textContent = e.message; }
+    }
+    async function gwRulesSave() {
+        const msg = document.getElementById('gwRulesMessage');
+        try {
+            const rules = JSON.parse(document.getElementById('gwRulesJson').value || '[]');
+            if (!Array.isArray(rules)) throw new Error('Reply rules must be a JSON array.');
+            const payload = {
+                enabled: document.getElementById('gwRulesEnabled').checked,
+                notifyCustomer: document.getElementById('gwNotifyCustomer').checked,
+                rules
+            };
+            const r = await fetch('/api/admin/gateway-reply-rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-admin-pass': adminPassCache },
+                body: JSON.stringify(payload)
+            });
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Save failed');
+            document.getElementById('gwRulesJson').value = JSON.stringify(d.config.rules || [], null, 2);
+            if (msg) msg.textContent = 'Saved successfully. ' + (d.message || '');
+        } catch (e) { if (msg) msg.textContent = 'Error: ' + e.message; }
+    }
+</script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
         :root { --bg:#0d0d0e; --side:#111112; --card:#171718; --card2:#1e1e20; --line:rgba(255,255,255,.07); --muted:#8e8e98; --text:#f3f3f5; --accent:#6d3df5; --accent2:#8b63ff; --green:#3ccf78; --yellow:#f2c94c; --red:#ef4d5a; --radius:18px; }
@@ -180,6 +422,8 @@
             <div class="nav-group">
                 <button class="nav-btn" data-nav="selected" onclick="showTab('selected')"><svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg><span>Selected users</span><span id="navSel" class="nav-badge g hidden">0</span></button>
                 <button class="nav-btn" data-nav="offers" onclick="showTab('offers')"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg><span>Offers</span></button>
+                <button class="nav-btn" data-nav="gateways" onclick="showTab('gateways')"><svg viewBox="0 0 24 24"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><path d="M9 11l6-4M9 13l6 4"/></svg><span>Gateway Routing</span></button>
+                <button class="nav-btn" data-nav="saas" onclick="showTab('saas')"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 9h8M8 13h5M8 17h3"/></svg><span>SaaS Tenants</span></button>
                 <button class="nav-btn" data-nav="connections" onclick="showTab('connections')"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg><span>Connections</span></button>
             </div>
             <div class="nav-group">
@@ -469,7 +713,43 @@
     </div>
 </section>
 
+
 <section data-tab="offers" class="hidden space-y-4">
+    <div class="card p-5 rounded-2xl space-y-4">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><h2 class="text-lg font-extrabold">Reach Pricing & Package Manager</h2>
+            <p class="text-xs text-slate-400 mt-1">Set the price per Reach and manage the exact finite package quantities customers can buy.</p></div>
+            <button class="btn btn-ghost btn-sm" onclick="rpLoad()">Reload pricing</button>
+        </div>
+        <p class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3">Only fixed, finite Reach/Coin packages are allowed. Unlimited packages and unlimited coin balances are not supported. Maximum 30 packages per channel; each package must contain a whole-number quantity.</p>
+        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div class="rounded-xl border border-slate-700 p-4 space-y-3">
+                <div><h3 class="font-bold">Website & WhatsApp</h3><p class="text-xs text-slate-400">Applies to the website, customer app and WhatsApp recharge list.</p></div>
+                <label class="block text-xs text-slate-400">Base price per Reach (₹)
+                    <input id="rpWebRate" class="fld mt-1" type="number" min="0.01" step="0.01" value="13">
+                </label>
+                <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead><tr class="text-slate-400 border-b border-slate-700">
+                    <th class="py-2">Reach / Coins</th><th class="py-2">Package Price (₹)</th><th class="py-2">Remove</th>
+                </tr></thead><tbody id="rpWebRows"></tbody></table></div>
+                <button class="btn btn-ghost btn-sm" onclick="rpAddRow('web')">+ Add package</button>
+            </div>
+            <div class="rounded-xl border border-slate-700 p-4 space-y-3">
+                <div><h3 class="font-bold">Telegram Referral Bot</h3><p class="text-xs text-slate-400">Separate package list, preserving the existing Telegram bot rate structure.</p></div>
+                <label class="block text-xs text-slate-400">Base price per Reach (₹)
+                    <input id="rpBotRate" class="fld mt-1" type="number" min="0.01" step="0.01" value="20">
+                </label>
+                <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead><tr class="text-slate-400 border-b border-slate-700">
+                    <th class="py-2">Reach / Coins</th><th class="py-2">Package Price (₹)</th><th class="py-2">Referral Commission (₹)</th><th class="py-2">Remove</th>
+                </tr></thead><tbody id="rpBotRows"></tbody></table></div>
+                <button class="btn btn-ghost btn-sm" onclick="rpAddRow('bot')">+ Add package</button>
+            </div>
+        </div>
+        <div class="flex items-center gap-3 flex-wrap">
+            <button class="btn btn-primary" onclick="rpSave()">Save Reach Pricing</button>
+            <span id="rpStatus" class="text-xs text-slate-400">Loading saved pricing…</span>
+        </div>
+    </div>
+
     <div class="card p-5 rounded-2xl">
         <h3 class="text-base font-extrabold mb-1">Create New Offer</h3>
         <p class="text-[11px] text-slate-400 mb-4">Submit karte hi ye offer sabhi Telegram aur WhatsApp customers ko (image ke saath) chala jayega, aur web portal par popup banner + "Offers" section me dikhega. Kharidna normal payment jaisa hi hai.</p>
@@ -663,6 +943,135 @@
     </div>
 </section>
         </div>
+
+<section data-tab="gateways" class="hidden space-y-4">
+    <div class="card p-5 rounded-2xl">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><h2 class="text-lg font-extrabold">Multi-Gateway Order Routing</h2>
+            <p class="text-xs text-slate-400 mt-1">Choose where new orders are dispatched. Telegram remains the default.</p></div>
+            <span id="gwStatus" class="text-xs text-emerald-300">Loading configuration…</span>
+        </div>
+    </div>
+    <div class="card p-5 rounded-2xl space-y-4">
+        <h3 class="font-bold text-sm">Order Gateway Mode</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label class="rounded-xl border border-slate-700 p-3 flex gap-3 items-start"><input type="radio" name="gwMode" value="telegram" checked><span><b class="text-sm">Telegram Only</b><small class="block text-slate-400">Send orders through the existing Telegram gateway.</small></span></label>
+            <label class="rounded-xl border border-slate-700 p-3 flex gap-3 items-start"><input type="radio" name="gwMode" value="whatsapp"><span><b class="text-sm">WhatsApp Only</b><small class="block text-slate-400">Send orders to the configured WhatsApp destination.</small></span></label>
+            <label class="rounded-xl border border-slate-700 p-3 flex gap-3 items-start"><input type="radio" name="gwMode" value="both"><span><b class="text-sm">Both Gateways</b><small class="block text-slate-400">Dispatch one internal order to both channels.</small></span></label>
+            <label class="rounded-xl border border-slate-700 p-3 flex gap-3 items-start"><input type="radio" name="gwMode" value="custom"><span><b class="text-sm">Primary + Backup</b><small class="block text-slate-400">Try the primary gateway and optionally fail over.</small></span></label>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div><label class="text-xs text-slate-400 block mb-1">Dispatch Mode</label>
+                <select id="gwDispatch" class="fld"><option value="direct">Direct Send</option><option value="queue">Durable FIFO Queue</option></select></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Both Mode Strategy</label>
+                <select id="gwBothStrategy" class="fld"><option value="parallel">Send to both in parallel</option><option value="sequential">Primary first, then secondary</option></select></div>
+        </div>
+    </div>
+    <div class="card p-5 rounded-2xl space-y-4">
+        <h3 class="font-bold text-sm">Gateway Connections & Destinations</h3>
+        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwTelegramEnabled" checked> Telegram Gateway Enabled</label>
+        <div><label class="text-xs text-slate-400 block mb-1">WhatsApp Destination Number (country code included)</label>
+            <input id="gwWhatsAppTarget" class="fld" placeholder="e.g. 919876543210" inputmode="numeric"></div>
+        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwWhatsAppEnabled"> WhatsApp Gateway Enabled</label>
+        <p class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3">The destination must be a number you control or are authorized to message. WhatsApp sending requires the linked WhatsApp session. Incoming replies can be interpreted using the configurable rules below.</p>
+    </div>
+    <div class="card p-5 rounded-2xl space-y-4">
+        <h3 class="font-bold text-sm">Primary / Backup Routing</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div><label class="text-xs text-slate-400 block mb-1">Primary Gateway</label><select id="gwPrimary" class="fld"><option value="telegram">Telegram</option><option value="whatsapp">WhatsApp</option></select></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Backup Gateway</label><select id="gwFallback" class="fld"><option value="whatsapp">WhatsApp</option><option value="telegram">Telegram</option></select></div>
+        </div>
+        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwFallbackEnabled"> Enable automatic fallback if the primary gateway fails</label>
+    </div>
+    <div class="flex gap-2 flex-wrap">
+        <button class="btn btn-primary" onclick="gwSave()">Save Gateway Configuration</button>
+        <button class="btn btn-ghost" onclick="gwLoad()">Reload</button>
+    </div>
+    <p id="gwMessage" class="text-xs text-slate-400"></p>
+    <div class="card p-5 rounded-2xl space-y-3">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><h3 class="font-bold text-sm">Incoming WhatsApp Gateway Replies</h3>
+            <p class="text-xs text-slate-400 mt-1">Replies from the configured gateway number that were safely matched to an active order.</p></div>
+            <button class="btn btn-ghost btn-sm" onclick="gwRepliesLoad()">Refresh replies</button>
+        </div>
+        <div id="gwRepliesStatus" class="text-xs text-slate-400">Load replies to view recent gateway responses.</div>
+        <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead><tr class="text-slate-400 border-b border-slate-700"><th class="py-2 pr-3">Received</th><th class="py-2 pr-3">Target ID</th><th class="py-2 pr-3">Detected type</th><th class="py-2 pr-3">Matched rule</th><th class="py-2 pr-3">Extracted value</th><th class="py-2 pr-3">Order status</th><th class="py-2 pr-3">Customer notice</th><th class="py-2">Gateway reply</th></tr></thead><tbody id="gwRepliesBody"><tr><td colspan="8" class="py-3 text-slate-500">No replies loaded.</td></tr></tbody></table></div>
+    </div>
+
+    <div class="card p-5 rounded-2xl space-y-4 mt-4">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><h3 class="font-bold text-sm">Phase 4 — Durable FIFO Order Queue</h3>
+            <p class="text-xs text-slate-400 mt-1">Monitor queued orders, processing, retry attempts and estimated waiting time.</p></div>
+            <button class="btn btn-ghost btn-sm" onclick="gwQueueLoad()">Refresh queue</button>
+        </div>
+        <div id="gwQueueStats" class="grid grid-cols-2 md:grid-cols-5 gap-2"><div class="text-xs text-slate-500">Load queue status to view counters.</div></div>
+        <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead><tr class="text-slate-400 border-b border-slate-700">
+            <th class="py-2 pr-3">Order ID</th><th class="py-2 pr-3">Target</th><th class="py-2 pr-3">Queue state</th><th class="py-2 pr-3">Position</th><th class="py-2 pr-3">ETA</th><th class="py-2 pr-3">Attempts</th><th class="py-2 pr-3">Last issue / refund review</th><th class="py-2">Action</th>
+        </tr></thead><tbody id="gwQueueBody"><tr><td colspan="8" class="py-3 text-slate-500">No queue data loaded.</td></tr></tbody></table></div>
+        <p id="gwQueueStatus" class="text-xs text-slate-400">Select Durable FIFO Queue in Dispatch Mode to queue new orders.</p>
+        <p class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3">Queue jobs are stored in MongoDB and survive restarts. Failed jobs can be retried by an administrator. Final delivery failure is flagged for manual refund review; no automatic duplicate credit is issued.</p>
+    </div>
+
+    <div class="card p-5 rounded-2xl space-y-4 mt-4">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><h3 class="font-bold text-sm">Phase 3 — Reply Rules & Customer Status Messages</h3>
+            <p class="text-xs text-slate-400 mt-1">Configure exact/contains matching, classification, optional field extraction and customer message templates.</p></div>
+            <button class="btn btn-ghost btn-sm" onclick="gwRulesLoad()">Load rules</button>
+        </div>
+        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwRulesEnabled"> Enable configurable reply rules</label>
+        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwNotifyCustomer"> Send configured status messages to the customer via Telegram</label>
+        <p class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3">Customer notifications are OFF by default. Rules only classify and annotate replies; they do not automatically approve payments or complete/reject orders. Test rules before enabling customer messages.</p>
+        <div>
+            <label class="text-xs text-slate-400 block mb-1">Reply rules (JSON)</label>
+            <textarea id="gwRulesJson" class="fld font-mono text-xs" rows="13" spellcheck="false"></textarea>
+            <p class="text-[11px] text-slate-400 mt-2">Fields: id, enabled, keyword, matchMode (exact/contains), classification (success_candidate/failure_candidate/in_progress/unclassified), customerMessage, extractPattern (optional JavaScript regular expression), extractLabel. Templates support {targetId}, {status} and {extracted}. First matching enabled rule wins.</p>
+        </div>
+        <div class="flex gap-2 flex-wrap">
+            <button class="btn btn-primary btn-sm" onclick="gwRulesSave()">Save Reply Rules</button>
+            <button class="btn btn-ghost btn-sm" onclick="gwRulesLoad()">Reload Rules</button>
+        </div>
+        <p id="gwRulesMessage" class="text-xs text-slate-400"></p>
+    </div>
+</section>
+
+<section data-tab="saas" class="hidden space-y-4">
+    <div class="card p-5 rounded-2xl">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div><h2 class="text-lg font-extrabold">SaaS Tenant Management</h2><p class="text-xs text-slate-400 mt-1">Register client workspaces and manage their plan and account status.</p></div>
+            <button class="btn btn-ghost btn-sm" onclick="saasLoadTenants()">Refresh tenants</button>
+        </div>
+        <p class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 mt-3">Phase 5 control-plane foundation: tenant registry, plan metadata and subscription lifecycle. Existing customer/order endpoints remain in legacy single-tenant mode until tenant-scoped authentication and data migration are completed and tested.</p>
+    </div>
+    <div class="card p-5 rounded-2xl space-y-4">
+        <h3 class="font-bold text-sm">Create Tenant Workspace</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div><label class="text-xs text-slate-400 block mb-1">Business / Workspace Name</label><input id="saasName" class="fld" placeholder="Example: Client Company"></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Workspace Slug</label><input id="saasSlug" class="fld" placeholder="client-company"></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Owner Name</label><input id="saasOwnerName" class="fld" placeholder="Account owner"></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Owner Email</label><input id="saasOwnerEmail" class="fld" type="email" placeholder="owner@example.com"></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Subscription Plan</label><select id="saasPlan" class="fld"><option value="free">Free</option><option value="starter">Starter</option><option value="growth">Growth</option><option value="business">Business</option></select></div>
+            <div><label class="text-xs text-slate-400 block mb-1">Trial Days (0–30)</label><input id="saasTrialDays" class="fld" type="number" min="0" max="30" value="14"></div>
+        </div>
+        <button class="btn btn-primary" onclick="saasCreateTenant()">Create Tenant</button><p id="saasCreateMessage" class="text-xs text-slate-400"></p>
+    </div>
+    <div class="card p-5 rounded-2xl space-y-3">
+        <div class="flex items-center justify-between gap-3 flex-wrap"><h3 class="font-bold text-sm">Registered Tenants</h3><span id="saasStatus" class="text-xs text-slate-400">Load tenant list.</span></div>
+        <div class="overflow-x-auto"><table class="w-full text-left text-xs"><thead><tr class="text-slate-400 border-b border-slate-700">
+            <th class="py-2 pr-3">Workspace</th><th class="py-2 pr-3">Owner</th><th class="py-2 pr-3">Plan</th><th class="py-2 pr-3">Status</th><th class="py-2 pr-3">Period Ends</th><th class="py-2 pr-3">Plan Limits</th><th class="py-2">Actions</th>
+        </tr></thead><tbody id="saasTenantBody"><tr><td colspan="7" class="py-3 text-slate-500">No tenant data loaded.</td></tr></tbody></table></div>
+    </div>
+    <div class="card p-5 rounded-2xl space-y-2">
+        <h3 class="font-bold text-sm">Initial Plan Catalogue (INR)</h3>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-2 text-xs">
+            <div class="rounded-xl border border-slate-700 p-3"><b>Free</b><div>₹0 / month</div><div class="text-slate-400">5 users · 100 orders</div></div>
+            <div class="rounded-xl border border-slate-700 p-3"><b>Starter</b><div>₹499 / month</div><div class="text-slate-400">50 users · 2,000 orders</div></div>
+            <div class="rounded-xl border border-slate-700 p-3"><b>Growth</b><div>₹1,499 / month</div><div class="text-slate-400">250 users · 15,000 orders</div></div>
+            <div class="rounded-xl border border-slate-700 p-3"><b>Business</b><div>₹3,999 / month</div><div class="text-slate-400">2,000 users · 100,000 orders</div></div>
+        </div>
+        <p class="text-[11px] text-slate-400">Starter catalogue values for planning only. Payment collection, automatic renewal and production enforcement are not enabled in this milestone.</p>
+    </div>
+</section>
+
     </main>
 
 <nav class="bottom-bar" aria-label="Main menu">
@@ -700,6 +1109,7 @@
             tgRefreshStatus();
             setInterval(tgRefreshStatus, 10000);
             setInterval(loadAdminData, 15000); // 🔄 Auto-refresh orders/users every 15s
+            gwLoad();
         } else {
             alert('Wrong Password!');
         }
@@ -713,6 +1123,18 @@
         catch (e) { throw new Error(t ? ('Server ka reply samajh nahi aaya (HTTP ' + r.status + ')') : ('Server se khali reply aaya (HTTP ' + r.status + ') - request time out ho gayi ho sakti hai')); }
     }
     async function tlGet(url) { return tlJson(await fetch(url, { headers: { 'x-admin-pass': adminPassCache }, cache: 'no-store' })); }
+    async function gwRepliesLoad() {
+        const status = document.getElementById('gwRepliesStatus');
+        const body = document.getElementById('gwRepliesBody');
+        if (status) status.textContent = 'Loading incoming replies…';
+        try {
+            const r = await fetch('/api/admin/gateway-replies', { headers: { 'x-admin-pass': adminPassCache }, cache: 'no-store' });
+            const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Could not load replies');
+            const rows = d.replies || [];
+            if (body) body.innerHTML = rows.length ? rows.map(x => `<tr class="border-b border-slate-800 align-top"><td class="py-2 pr-3 whitespace-nowrap">${tlEsc(x.receivedAt ? new Date(x.receivedAt).toLocaleString() : '')}</td><td class="py-2 pr-3">${tlEsc(x.targetId)}</td><td class="py-2 pr-3">${tlEsc(x.classification)}</td><td class="py-2 pr-3">${tlEsc(x.ruleId || 'Default')}</td><td class="py-2 pr-3">${tlEsc(x.extractLabel ? x.extractLabel + ': ' : '')}${tlEsc(x.extracted || '—')}</td><td class="py-2 pr-3">${tlEsc(x.orderStatus)}</td><td class="py-2 pr-3">${x.customerNoticeSent ? 'Sent' : 'Not sent'}</td><td class="py-2 min-w-[220px] whitespace-pre-wrap">${tlEsc(x.text)}</td></tr>`).join('') : '<tr><td colspan="8" class="py-3 text-slate-500">No matched gateway replies found.</td></tr>';
+            if (status) status.textContent = `${rows.length} recent reply record(s). Unmatched or ambiguous replies are intentionally not assigned.`;
+        } catch (e) { if (status) status.textContent = 'Error: ' + e.message; }
+    }
     async function tlPost(url, body) {
         return tlJson(await fetch(url, { method: 'POST', headers: {'Content-Type': 'application/json', 'x-admin-pass': adminPassCache}, body: JSON.stringify(body || {}) }));
     }
@@ -1468,7 +1890,7 @@
     // ================= NEW: tabs, customers, customer page =================
     let currentCustomerId = null;
     let currentCustomer = null;
-    const TAB_NAMES = ['overview','customers','payments','teams','connections','selected','offers','logs','testlab','security','settings'];
+    const TAB_NAMES = ['overview','customers','payments','teams','connections','gateways','selected','offers','logs','testlab','security','settings'];
 
     function showTab(name) {
         if (!TAB_NAMES.includes(name)) name = 'overview';
@@ -1482,8 +1904,9 @@
         if (name === 'customers') loadCustomers();
         if (name === 'payments') payOpen(); else payStopPoll();
         if (name === 'logs') logsOpen(); else logsStop();
-        if (name === 'offers') offOpen(); else offStopPoll();
+        if (name === 'offers') { offOpen(); rpLoad(); } else offStopPoll();
         if (name === 'connections') sheetLoad();
+        if (name === 'gateways') { gwLoad(); gwRepliesLoad(); }
         if (name === 'selected') selOpen(); else selStop();
         if (name === 'overview') setTimeout(renderOverviewChart, 30);
     }

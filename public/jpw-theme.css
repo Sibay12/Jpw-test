@@ -1,0 +1,129 @@
+
+/* JPW Premium UI Refresh — presentation layer only; existing IDs and handlers remain intact. */
+:root,html[data-jpw-theme="dark"]{
+ --jpw-bg:#080f1d;--jpw-surface:#111c2e;--jpw-surface-2:#0c1728;--jpw-text:#edf4ff;
+ --jpw-muted:#91a2bd;--jpw-line:#26364f;--jpw-accent:#2dd4bf;--jpw-accent-2:#14b8a6;
+ --jpw-shadow:0 18px 44px rgba(0,0,0,.28);
+}
+html[data-jpw-theme="light"]{
+ --jpw-bg:#f4f7fb;--jpw-surface:#ffffff;--jpw-surface-2:#f8fafc;--jpw-text:#172033;
+ --jpw-muted:#64748b;--jpw-line:#e2e8f0;--jpw-accent:#0f9f8f;--jpw-accent-2:#0b7f73;
+ --jpw-shadow:0 14px 38px rgba(15,23,42,.08);
+}
+html,body{min-height:100%;background:var(--jpw-bg)!important;color:var(--jpw-text)!important}
+body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif!important;transition:background .2s,color .2s}
+#jpw-theme-toggle{
+ position:fixed;right:18px;top:16px;z-index:100001;display:inline-flex;align-items:center;gap:8px;
+ padding:10px 14px;border-radius:999px;border:1px solid var(--jpw-line);background:var(--jpw-surface);
+ color:var(--jpw-text);font:700 12px Inter,system-ui;box-shadow:var(--jpw-shadow);cursor:pointer
+}
+#jpw-theme-toggle:hover{transform:translateY(-1px);border-color:var(--jpw-accent)}
+/* Shared surfaces */
+.card,.container,.user-box,.top-header,.pkg-card,.menu-item,#admin-login-box,
+#infoModal>div,.stat,.logbox,.jo-card,.jo-pop{
+ background:var(--jpw-surface)!important;color:var(--jpw-text)!important;border-color:var(--jpw-line)!important;
+ box-shadow:var(--jpw-shadow)
+}
+input,textarea,select,.fld{
+ background:var(--jpw-surface-2)!important;color:var(--jpw-text)!important;border:1px solid var(--jpw-line)!important;
+ border-radius:12px!important
+}
+input::placeholder,textarea::placeholder{color:var(--jpw-muted)!important}
+button,.btn{border-radius:12px;transition:transform .16s ease,filter .16s ease,box-shadow .16s ease}
+button:hover,.btn:hover{filter:brightness(1.07)}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid color-mix(in srgb,var(--jpw-accent) 38%,transparent);outline-offset:2px}
+h1,h2,h3,h4,p,label,span,th,td{scroll-margin-top:18px}
+a{color:var(--jpw-accent)}
+/* Admin workspace */
+#admin-login-box{max-width:420px!important;margin:clamp(60px,12vh,130px) auto 24px!important;border:1px solid var(--jpw-line)!important;border-radius:24px!important}
+#admin-dashboard{min-height:100vh;background:var(--jpw-bg)!important}
+#admin-dashboard>aside{
+ background:var(--jpw-surface)!important;border-color:var(--jpw-line)!important;
+ box-shadow:8px 0 30px rgba(15,23,42,.035);z-index:20
+}
+#admin-dashboard>aside nav{gap:5px!important}
+#admin-dashboard .nav-btn{border:1px solid transparent;transition:all .16s ease;color:var(--jpw-muted)}
+#admin-dashboard .nav-btn:hover{background:var(--jpw-surface-2)!important;color:var(--jpw-text)!important;border-color:var(--jpw-line)}
+#admin-dashboard .nav-btn.active{background:color-mix(in srgb,var(--jpw-accent) 13%,var(--jpw-surface))!important;color:var(--jpw-accent)!important;border-color:color-mix(in srgb,var(--jpw-accent) 28%,var(--jpw-line))}
+#admin-dashboard main{max-width:1500px!important;padding:clamp(14px,2.5vw,34px)!important}
+#admin-dashboard main>div:first-child{position:sticky;top:10px;z-index:15;padding:10px;background:color-mix(in srgb,var(--jpw-bg) 88%,transparent);backdrop-filter:blur(14px);border:1px solid var(--jpw-line);border-radius:16px}
+#admin-dashboard .stat{border-radius:18px!important;padding:18px!important}
+#admin-dashboard .stat .v{font-size:clamp(1.35rem,2vw,1.9rem)!important;letter-spacing:-.04em}
+#admin-dashboard table{border-collapse:separate;border-spacing:0;width:100%}
+#admin-dashboard th{background:var(--jpw-surface-2);color:var(--jpw-muted);text-transform:uppercase;letter-spacing:.06em;font-size:10px;padding:12px}
+#admin-dashboard td{border-top:1px solid var(--jpw-line);padding:12px 10px;color:var(--jpw-text)}
+#admin-dashboard .rounded-xl,#admin-dashboard .rounded-2xl{border-color:var(--jpw-line)}
+/* Customer experience */
+body:has(#web-login-screen) .container,
+body:has(#auth-container)>div.w-full.max-w-md{
+ width:min(100%,720px)!important;max-width:720px!important;margin:18px auto!important;padding:clamp(18px,3vw,30px)!important;
+ border-radius:26px!important;border:1px solid var(--jpw-line)!important;box-shadow:var(--jpw-shadow)!important
+}
+.logo-box{padding-bottom:16px;border-bottom:1px solid var(--jpw-line)}
+.top-header{border-radius:16px!important}
+.user-box{border-radius:18px!important}
+.bottom-menu{border-top-color:var(--jpw-line)!important}
+.menu-item{min-height:48px;border-radius:14px!important}
+.pkg-card{border-radius:16px!important}
+#dashboard-screen,#app-dashboard{animation:jpw-rise .35s ease both}
+@keyframes jpw-rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:767px){
+ #jpw-theme-toggle{top:10px;right:10px;padding:8px 11px;font-size:11px}
+ #admin-dashboard{display:block!important}
+ #admin-dashboard>aside{position:sticky!important;top:0;min-height:auto!important;width:100%!important;padding:10px!important;border-right:0!important;border-bottom:1px solid var(--jpw-line)}
+ #admin-dashboard>aside>div{display:flex!important;align-items:center;justify-content:space-between;padding:4px 8px 10px!important}
+ #admin-dashboard>aside nav{display:flex!important;overflow-x:auto!important;flex-direction:row!important;padding-bottom:4px}
+ #admin-dashboard .nav-btn{flex:0 0 auto;padding:9px 12px!important;font-size:12px!important}
+ #admin-dashboard main{padding:12px!important}
+ #admin-dashboard main>div:first-child{position:static}
+ #admin-dashboard .overflow-x-auto{max-width:100%}
+ body:has(#web-login-screen) .container,body:has(#auth-container)>div.w-full.max-w-md{margin:56px auto 14px!important;padding:17px!important}
+ .bottom-menu{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+
+html[data-jpw-theme="light"] #admin-dashboard .bg-slate-950,
+html[data-jpw-theme="light"] #admin-dashboard .bg-slate-900,
+html[data-jpw-theme="light"] #admin-dashboard .bg-slate-900\/50,
+html[data-jpw-theme="light"] #admin-dashboard .bg-slate-800,
+html[data-jpw-theme="light"] #admin-dashboard .bg-slate-800\/50,
+html[data-jpw-theme="light"] #admin-dashboard .bg-\[\#0b0d13\]{
+ background:#f8fafc!important
+}
+html[data-jpw-theme="light"] #admin-dashboard .text-white,
+html[data-jpw-theme="light"] #admin-dashboard .text-slate-100,
+html[data-jpw-theme="light"] #admin-dashboard .text-slate-200,
+html[data-jpw-theme="light"] #admin-dashboard .text-slate-300,
+html[data-jpw-theme="light"] #admin-dashboard .text-slate-400{
+ color:#334155!important
+}
+html[data-jpw-theme="light"] #admin-dashboard .border-slate-700,
+html[data-jpw-theme="light"] #admin-dashboard .border-slate-800,
+html[data-jpw-theme="light"] #admin-dashboard .border-slate-900{
+ border-color:#e2e8f0!important
+}
+html[data-jpw-theme="light"] body:has(#web-login-screen) .container,
+html[data-jpw-theme="light"] body:has(#auth-container)>div.w-full.max-w-md{
+ background:#fff!important;color:#172033!important
+}
+html[data-jpw-theme="light"] body:has(#web-login-screen) .container input,
+html[data-jpw-theme="light"] body:has(#auth-container) input,
+html[data-jpw-theme="light"] body:has(#auth-container) textarea,
+html[data-jpw-theme="light"] body:has(#auth-container) select{
+ background:#f8fafc!important;color:#172033!important;border-color:#dbe3ee!important
+}
+html[data-jpw-theme="light"] body:has(#web-login-screen) h2,
+html[data-jpw-theme="light"] body:has(#web-login-screen) h3,
+html[data-jpw-theme="light"] body:has(#web-login-screen) h4,
+html[data-jpw-theme="light"] body:has(#web-login-screen) p,
+html[data-jpw-theme="light"] body:has(#web-login-screen) label,
+html[data-jpw-theme="light"] body:has(#web-login-screen) .user-box,
+html[data-jpw-theme="light"] body:has(#web-login-screen) .menu-item,
+html[data-jpw-theme="light"] body:has(#auth-container) .text-white,
+html[data-jpw-theme="light"] body:has(#auth-container) .text-slate-100,
+html[data-jpw-theme="light"] body:has(#auth-container) .text-slate-200,
+html[data-jpw-theme="light"] body:has(#auth-container) .text-slate-300,
+html[data-jpw-theme="light"] body:has(#auth-container) .text-slate-400{
+ color:#263449!important
+}

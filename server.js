@@ -223,7 +223,7 @@ app.use('/api', (req, res, next) => {
 });
 
 // 📦 Telegram Referral Bot Pricing Chart (₹20 = 1 Coin)
-const BOT_RECHARGE_PACKAGES = [
+let BOT_RECHARGE_PACKAGES = [
     { amount: 20, coins: 1, commission: 5 },
     { amount: 55, coins: 3, commission: 3 },
     { amount: 105, coins: 7, commission: 2 },
@@ -232,7 +232,7 @@ const BOT_RECHARGE_PACKAGES = [
 
 // 📦 Web Portal Pricing Chart (₹13 = 1 Coin - Original Rates)
 let waPackCount = 5;   // number of packages shown in the WhatsApp list (regular + live offers) - set right before the list is sent
-const WEB_RECHARGE_PACKAGES = [
+let WEB_RECHARGE_PACKAGES = [
     { amount: 13, coins: 1 },
     { amount: 60, coins: 5 },
     { amount: 115, coins: 10 },
@@ -757,10 +757,8 @@ async function initUserbotBridge() {
                         if (orderOwner && orderOwner.referredBy && orderOwner.referredBy !== 'ADMIN_DIRECT') {
                             const referrer = await UserModel.findOne({ referralCode: orderOwner.referredBy });
                             if (referrer) {
-                                let earnedComm = 5.00;
-                                if (orderOwner.lastPackageCoins === 3) earnedComm = 3.00;
-                                else if (orderOwner.lastPackageCoins === 7) earnedComm = 2.00;
-                                else if (orderOwner.lastPackageCoins === 15) earnedComm = 1.00;
+                                const matchedReferralPack = BOT_RECHARGE_PACKAGES.find(p => Number(p.coins) === Number(orderOwner.lastPackageCoins));
+                                const earnedComm = matchedReferralPack ? Number(matchedReferralPack.commission || 0) : 0;
 
                                 referrer.commissionBalance = (referrer.commissionBalance || 0) + earnedComm;
                                 await referrer.save();
@@ -1192,6 +1190,126 @@ app.get('/api/admin/wa/status', requireAdminAuth, (req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json({ success: true, ...wa.getStatus() });
 });
+
+// ================= MULTI-GATEWAY ORDER ROUTING =================
+// First rollout keeps the existing Telegram MTProto path as the default.
+// WhatsApp uses the already-linked Baileys session and a separately configured destination number.
+const DEFAULT_GATEWAY_ROUTING = {
+    mode: 'telegram',                 // telegram | whatsapp | both | custom
+    dispatch: 'direct',               // direct | queue (queue engine is a separate rollout)
+    telegramEnabled: true,
+    whatsappEnabled: false,
+    whatsappTarget: '',
+    bothStrategy: 'parallel',         // parallel | sequential
+    fallbackEnabled: false,
+    primaryGateway: 'telegram',
+    fallbackGateway: 'whatsapp',
+    updatedAt: null
+};
+async function getGatewayRoutingConfig() {
+    try {
+        const doc = await SettingModel.findOne({ key: 'gatewayRouting' }).lean();
+        const saved = doc && doc.value ? JSON.parse(doc.value) : {};
+        return { ...DEFAULT_GATEWAY_ROUTING, ...saved };
+    } catch (e) {
+        debugLog('Gateway', 'Could not load routing config:', e.message);
+        return { ...DEFAULT_GATEWAY_ROUTING };
+    }
+}
+
+// Phase 3 configurable reply interpretation. It annotates replies only; it never
+// changes order/payment state automatically.
+const DEFAULT_GATEWAY_REPLY_RULES = {
+    enabled: false, notifyCustomer: false,
+    rules: [
+        { id: 'success-default', enabled: true, keyword: 'status: success', matchMode: 'contains', classification: 'success_candidate', customerMessage: 'Your request for {targetId} has received a success update.', extractPattern: '', extractLabel: '' },
+        { id: 'failure-default', enabled: true, keyword: 'status: failed', matchMode: 'contains', classification: 'failure_candidate', customerMessage: 'There is an issue with your request for {targetId}. Our team will review it.', extractPattern: '', extractLabel: '' },
+        { id: 'progress-default', enabled: true, keyword: 'processing', matchMode: 'contains', classification: 'in_progress', customerMessage: 'Your request for {targetId} is currently being processed.', extractPattern: '', extractLabel: '' }
+    ], updatedAt: null
+};
+async function getGatewayReplyRules() {
+    try {
+        const doc = await SettingModel.findOne({ key: 'gatewayReplyRules' }).lean();
+        const saved = doc && doc.value ? JSON.parse(doc.value) : {};
+        return { ...DEFAULT_GATEWAY_REPLY_RULES, ...saved, rules: Array.isArray(saved.rules) ? saved.rules : DEFAULT_GATEWAY_REPLY_RULES.rules };
+    } catch (e) {
+        debugLog('Gateway', 'Could not load reply rules:', e.message);
+        return { ...DEFAULT_GATEWAY_REPLY_RULES, rules: DEFAULT_GATEWAY_REPLY_RULES.rules.map(r => ({ ...r })) };
+    }
+}
+function sanitizeGatewayReplyRules(input) {
+    const b = input && typeof input === 'object' ? input : {};
+    const allowed = ['success_candidate', 'failure_candidate', 'in_progress', 'unclassified'];
+    const rules = (Array.isArray(b.rules) ? b.rules : []).slice(0, 30).map((r, i) => ({
+        id: String(r.id || `rule-${i + 1}`).replace(/[^a-z0-9_-]/gi, '').slice(0, 40) || `rule-${i + 1}`,
+        enabled: r.enabled !== false, keyword: String(r.keyword || '').trim().slice(0, 120),
+        matchMode: r.matchMode === 'exact' ? 'exact' : 'contains',
+        classification: allowed.includes(r.classification) ? r.classification : 'unclassified',
+        customerMessage: String(r.customerMessage || '').trim().slice(0, 500),
+        extractPattern: String(r.extractPattern || '').trim().slice(0, 160),
+        extractLabel: String(r.extractLabel || '').trim().slice(0, 40)
+    })).filter(r => r.keyword);
+    return { enabled: b.enabled === true, notifyCustomer: b.notifyCustomer === true, rules, updatedAt: new Date().toISOString() };
+}
+app.get('/api/admin/gateway-reply-rules', requireAdminAuth, async (req, res) => {
+    const config = await getGatewayReplyRules();
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, config });
+});
+app.post('/api/admin/gateway-reply-rules', requireAdminAuth, async (req, res) => {
+    try {
+        const config = sanitizeGatewayReplyRules(req.body || {});
+        for (const rule of config.rules) {
+            if (rule.extractPattern) {
+                try { new RegExp(rule.extractPattern, 'i'); }
+                catch (_) { return res.status(400).json({ success: false, message: `Invalid extraction pattern in rule "${rule.id}".` }); }
+            }
+        }
+        await SettingModel.findOneAndUpdate({ key: 'gatewayReplyRules' },
+            { $set: { value: JSON.stringify(config), updatedAt: new Date() } }, { upsert: true, new: true });
+        res.json({ success: true, config, message: 'Gateway reply rules saved.' });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+app.get('/api/admin/gateway-routing', requireAdminAuth, async (req, res) => {
+    const config = await getGatewayRoutingConfig();
+    // Never return credentials or session material from this endpoint.
+    res.json({ success: true, config });
+});
+app.post('/api/admin/gateway-routing', requireAdminAuth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const allowedModes = ['telegram', 'whatsapp', 'both', 'custom'];
+        const allowedDispatch = ['direct', 'queue'];
+        const allowedStrategies = ['parallel', 'sequential'];
+        const mode = allowedModes.includes(String(b.mode)) ? String(b.mode) : 'telegram';
+        const dispatch = allowedDispatch.includes(String(b.dispatch)) ? String(b.dispatch) : 'direct';
+        const bothStrategy = allowedStrategies.includes(String(b.bothStrategy)) ? String(b.bothStrategy) : 'parallel';
+        const whatsappTarget = String(b.whatsappTarget || '').replace(/[^0-9]/g, '');
+        if (['whatsapp', 'both', 'custom'].includes(mode) && (b.whatsappEnabled !== false) && (whatsappTarget.length < 8 || whatsappTarget.length > 15)) {
+            return res.status(400).json({ success: false, message: 'Enter the WhatsApp destination number with country code (8–15 digits).' });
+        }
+        const config = {
+            mode, dispatch, bothStrategy,
+            telegramEnabled: b.telegramEnabled !== false,
+            whatsappEnabled: b.whatsappEnabled === true,
+            whatsappTarget,
+            fallbackEnabled: b.fallbackEnabled === true,
+            primaryGateway: b.primaryGateway === 'whatsapp' ? 'whatsapp' : 'telegram',
+            fallbackGateway: b.fallbackGateway === 'telegram' ? 'telegram' : 'whatsapp',
+            updatedAt: new Date().toISOString()
+        };
+        await SettingModel.findOneAndUpdate(
+            { key: 'gatewayRouting' },
+            { $set: { value: JSON.stringify(config), updatedAt: new Date() } },
+            { upsert: true, new: true }
+        );
+        debugLog('Gateway', `Routing saved: ${config.mode}/${config.dispatch}`);
+        res.json({ success: true, config, message: 'Gateway routing settings saved.' });
+    } catch (e) {
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
 app.post('/api/admin/wa/connect', requireAdminAuth, async (req, res) => {
     try {
         const cur = wa.getStatus().state;
@@ -1215,10 +1333,11 @@ app.post('/api/admin/wa/test-message', requireAdminAuth, async (req, res) => {
 let mongoAttempt = 0;
 async function onMongoConnected() {
     debugLog('Server', '✅ MongoDB connected.');
+    try { startGatewayQueueWorker(); debugLog('GatewayQueue', 'Durable FIFO worker started.'); } catch (e) { debugLog('GatewayQueue', 'Worker start failed:', e.message); }
     try { await loadServiceHours(); } catch (e) { debugLog('Server', 'loadServiceHours:', e.message); }
     try { await loadSheetUrl(); } catch (e) { debugLog('Server', 'loadSheetUrl:', e.message); }
     try { await OfferModel.updateMany({ 'delivery.status': 'sending' }, { $set: { 'delivery.status': 'interrupted', 'delivery.note': 'Server restart hua - "Send remaining" dabakar baaki logon ko bhej sakte hain.' } }); } catch (e) {}
-    const steps = [loadMaintenance, initAllBots, startEmbeddedBot, initUserbotBridge, startSmartGreetingsTimer, startPackageExpiryTimer, startOrderTimeoutSweeper, () => wa.autoStart(), reloadSelected, () => waSel.autoStart()];
+    const steps = [loadMaintenance, loadReachPricing, initAllBots, startEmbeddedBot, initUserbotBridge, startSmartGreetingsTimer, startPackageExpiryTimer, startOrderTimeoutSweeper, () => wa.autoStart(), reloadSelected, () => waSel.autoStart()];
     for (const step of steps) {
         try { await step(); } catch (e) { debugLog('Server', `startup step ${step.name} failed:`, e.message); }
     }
@@ -1257,6 +1376,7 @@ connectMongoWithRetry();
 
 // --- SCHEMAS ---
 const userSchema = new mongoose.Schema({
+    tenantId: { type: String, default: 'legacy', index: true },
     telegramChatId: { type: String, required: true, unique: true },
     customId: { type: String, unique: true, sparse: true },
     password: { type: String, default: null },
@@ -1284,6 +1404,7 @@ userSchema.set('toJSON', {
 });
 
 const orderSchema = new mongoose.Schema({
+    tenantId: { type: String, default: 'legacy', index: true },
     telegramChatId: String,
     targetId: String,
     targetPass: String,
@@ -1293,6 +1414,15 @@ const orderSchema = new mongoose.Schema({
     isPriority: { type: Boolean, default: false },
     isTest: { type: Boolean, default: false },   // placed from the Admin Panel Test Lab (no coin, no customer message)
     botMsgId: { type: String, default: '' },     // id of the third-party bot's reply message for this order (the bot EDITS that same message)
+    gatewayMode: { type: String, default: 'telegram' },
+    gatewayDispatch: { type: String, default: 'direct' },
+    gatewayQueueJobId: { type: String, default: '' },
+    gatewayQueuePosition: { type: Number, default: 0 },
+    gatewayQueueEtaSeconds: { type: Number, default: 0 },
+    gatewayResults: { type: mongoose.Schema.Types.Mixed, default: {} },
+    gatewayReplies: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    gatewayReplyState: { type: String, default: 'waiting' },
+    gatewayReplyUpdatedAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 }, { timestamps: { createdAt: false, updatedAt: true } });   // updatedAt = when the status / customer message last changed
 
@@ -1318,6 +1448,7 @@ const announcementSchema = new mongoose.Schema({
 });
 
 const paymentSchema = new mongoose.Schema({
+    tenantId: { type: String, default: 'legacy', index: true },
     orderId: { type: String, required: true, unique: true },
     amount: Number,
     coins: Number,
@@ -1334,10 +1465,292 @@ const settingSchema = new mongoose.Schema({
 
 const UserModel = mongoose.model('User', userSchema);
 const OrderModel = mongoose.model('Order', orderSchema);
+
+// Admin-only view of replies received from the configured external WhatsApp gateway.
+// Phase 4: admin-only queue monitor and manual retry for failed jobs.
+
+// Phase 5 — super-admin tenant and subscription management.
+// API keys are generated once and stored only as SHA-256 hashes.
+async function requireTenantAuth(req, res, next) {
+    try {
+        const rawKey = String(req.headers['x-tenant-key'] || '');
+        if (!rawKey || rawKey.length < 32) return res.status(401).json({ success: false, message: 'Tenant API key required.' });
+        const hash = crypto.createHash('sha256').update(rawKey).digest('hex');
+        const tenant = await TenantModel.findOne({ tenantKeyHash: hash }).lean();
+        if (!tenant) return res.status(401).json({ success: false, message: 'Invalid tenant API key.' });
+        if (!['trial','active'].includes(tenant.status)) return res.status(403).json({ success: false, message: 'Tenant workspace is not active.' });
+        if (tenant.status === 'trial' && tenant.trialEndsAt && tenant.trialEndsAt < new Date())
+            return res.status(403).json({ success: false, message: 'Tenant trial has expired.' });
+        req.tenant = tenant;
+        next();
+    } catch (e) { res.status(500).json({ success: false, message: 'Tenant authentication could not be completed.' }); }
+}
+app.get('/api/tenant/context', requireTenantAuth, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, tenant: tenantPublicView(req.tenant) });
+});
+
+
+// Admin-managed finite Reach pricing for Website/WhatsApp and Telegram Referral Bot.
+app.get('/api/admin/reach-pricing', requireAdminAuth, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, pricing: reachPricing, limits: { maxPackagesPerChannel: 30, maxReachesPerPackage: 100000 } });
+});
+app.post('/api/admin/reach-pricing', requireAdminAuth, async (req, res) => {
+    try {
+        const web = cleanReachPricingSet(req.body?.web, 'Website / WhatsApp');
+        const bot = cleanReachPricingSet(req.body?.bot, 'Telegram Referral Bot');
+        const next = { web, bot };
+        await setSettingValue('reach_pricing_v1', JSON.stringify(next));
+        reachPricing = next;
+        WEB_RECHARGE_PACKAGES = web.packages;
+        BOT_RECHARGE_PACKAGES = bot.packages;
+        res.set('Cache-Control', 'no-store');
+        res.json({ success: true, pricing: reachPricing, message: 'Finite Reach pricing saved and applied to new package purchases.' });
+    } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+});
+
+app.get('/api/admin/saas/plans', requireAdminAuth, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, plans: SAAS_PLANS });
+});
+app.get('/api/admin/saas/tenants', requireAdminAuth, async (req, res) => {
+    try {
+        const tenants = await TenantModel.find({}).sort({ createdAt: -1 }).limit(500).lean();
+        const ids = tenants.map(t => t.tenantId);
+        const subscriptions = await TenantSubscriptionModel.find({ tenantId: { $in: ids } })
+            .sort({ createdAt: -1 }).lean();
+        const latest = new Map();
+        for (const s of subscriptions) if (!latest.has(s.tenantId)) latest.set(s.tenantId, s);
+        res.set('Cache-Control', 'no-store');
+        res.json({ success: true, tenants: tenants.map(t => ({
+            ...tenantPublicView(t), latestSubscription: latest.get(t.tenantId) || null
+        })) });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+app.post('/api/admin/saas/tenants', requireAdminAuth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        const name = String(b.name || '').trim().slice(0, 100);
+        const ownerEmail = String(b.ownerEmail || '').trim().toLowerCase();
+        const slug = tenantSlug(b.slug || name);
+        const plan = Object.prototype.hasOwnProperty.call(SAAS_PLANS, b.plan) ? b.plan : 'free';
+        if (!name || !slug || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(ownerEmail))
+            return res.status(400).json({ success: false, message: 'Valid tenant name, slug and owner email are required.' });
+        const existing = await TenantModel.findOne({ $or: [{ slug }, { ownerEmail, status: { $in: ['trial','active','past_due'] } }] }).lean();
+        if (existing) return res.status(409).json({ success: false, message: 'Tenant slug already exists or this owner email already has an active tenant.' });
+        const tenantId = 'tn_' + crypto.randomBytes(10).toString('hex');
+        const rawKey = 'jpw_tnt_' + crypto.randomBytes(32).toString('hex');
+        const now = new Date();
+        const requestedTrialDays = Number(b.trialDays ?? 14);
+        if (!Number.isFinite(requestedTrialDays) || requestedTrialDays < 0 || requestedTrialDays > 30) return res.status(400).json({ success: false, message: 'Trial days must be between 0 and 30.' });
+        const trialDays = Math.floor(requestedTrialDays);
+        const limits = { ...SAAS_PLANS[plan] };
+        delete limits.label; delete limits.monthlyPrice;
+        const tenant = await TenantModel.create({
+            tenantId, slug, name, ownerEmail, ownerName: String(b.ownerName || '').trim().slice(0, 100),
+            plan, status: trialDays > 0 ? 'trial' : 'active',
+            tenantKeyHash: crypto.createHash('sha256').update(rawKey).digest('hex'),
+            limits: { maxUsers: limits.maxUsers, maxOrdersPerMonth: limits.maxOrdersPerMonth, maxAdmins: limits.maxAdmins },
+            features: limits.features, trialEndsAt: trialDays > 0 ? new Date(now.getTime()+trialDays*86400000) : null,
+            currentPeriodStart: now, currentPeriodEnd: new Date(now.getTime()+30*86400000), createdAt: now, updatedAt: now
+        });
+        await TenantSubscriptionModel.create({
+            tenantId, plan, status: tenant.status, amount: SAAS_PLANS[plan].monthlyPrice,
+            currency: 'INR', billingCycle: 'monthly', startsAt: now, endsAt: tenant.currentPeriodEnd,
+            notes: 'Created from JPW super-admin tenant control panel.'
+        });
+        res.status(201).json({
+            success: true, tenant: tenantPublicView(tenant),
+            tenantApiKey: rawKey,
+            warning: 'Copy this API key now. It is shown only once and is not stored in readable form.'
+        });
+    } catch (e) {
+        if (e && e.code === 11000) return res.status(409).json({ success: false, message: 'Tenant slug or ID already exists.' });
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+app.patch('/api/admin/saas/tenants/:tenantId', requireAdminAuth, async (req, res) => {
+    try {
+        const allowedStatus = ['trial','active','past_due','suspended','cancelled'];
+        const allowedPlans = Object.keys(SAAS_PLANS);
+        const update = { updatedAt: new Date() };
+        if (req.body?.status !== undefined) {
+            if (!allowedStatus.includes(req.body.status)) return res.status(400).json({ success: false, message: 'Invalid tenant status.' });
+            update.status = req.body.status;
+        }
+        if (req.body?.plan !== undefined) {
+            if (!allowedPlans.includes(req.body.plan)) return res.status(400).json({ success: false, message: 'Invalid subscription plan.' });
+            const p = SAAS_PLANS[req.body.plan];
+            update.plan = req.body.plan;
+            update.limits = { maxUsers: p.maxUsers, maxOrdersPerMonth: p.maxOrdersPerMonth, maxAdmins: p.maxAdmins };
+            update.features = p.features;
+        }
+        if (req.body?.currentPeriodEnd !== undefined) {
+            const date = new Date(req.body.currentPeriodEnd);
+            if (Number.isNaN(date.getTime())) return res.status(400).json({ success: false, message: 'Invalid subscription end date.' });
+            update.currentPeriodEnd = date;
+        }
+        const tenant = await TenantModel.findOneAndUpdate({ tenantId: req.params.tenantId }, { $set: update }, { new: true });
+        if (!tenant) return res.status(404).json({ success: false, message: 'Tenant not found.' });
+        if (update.plan || update.status) {
+            await TenantSubscriptionModel.create({
+                tenantId: tenant.tenantId, plan: tenant.plan, status: tenant.status,
+                amount: SAAS_PLANS[tenant.plan].monthlyPrice, currency: 'INR',
+                billingCycle: 'monthly', startsAt: new Date(), endsAt: tenant.currentPeriodEnd,
+                notes: 'Plan/status updated by super-admin.'
+            });
+        }
+        res.json({ success: true, tenant: tenantPublicView(tenant) });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+app.post('/api/admin/saas/tenants/:tenantId/rotate-key', requireAdminAuth, async (req, res) => {
+    try {
+        const rawKey = 'jpw_tnt_' + crypto.randomBytes(32).toString('hex');
+        const hash = crypto.createHash('sha256').update(rawKey).digest('hex');
+        const tenant = await TenantModel.findOneAndUpdate({ tenantId: req.params.tenantId },
+            { $set: { tenantKeyHash: hash, updatedAt: new Date() } }, { new: true });
+        if (!tenant) return res.status(404).json({ success: false, message: 'Tenant not found.' });
+        res.json({ success: true, tenant: tenantPublicView(tenant), tenantApiKey: rawKey,
+            warning: 'Previous key is now invalid. Copy this new key now; it is shown only once.' });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+app.get('/api/admin/gateway-queue', requireAdminAuth, async (req, res) => {
+    try {
+        const since = new Date(Date.now()-24*60*60*1000);
+        const [queued, processing, retry, sent, failed, docs] = await Promise.all([
+            GatewayQueueModel.countDocuments({status:'queued'}), GatewayQueueModel.countDocuments({status:'processing'}),
+            GatewayQueueModel.countDocuments({status:'retry'}), GatewayQueueModel.countDocuments({status:'sent',completedAt:{$gte:since}}),
+            GatewayQueueModel.countDocuments({status:'failed'}),
+            GatewayQueueModel.find({status:{$in:['queued','processing','retry','failed']}}).sort({createdAt:1}).limit(100)
+                .select('-targetPass -gatewayConfig').lean()
+        ]);
+        let pos=0;
+        const jobs=docs.map(j=>({id:String(j._id),orderId:j.orderId,targetId:j.targetId,status:j.status,
+            attempts:j.attempts,maxAttempts:j.maxAttempts,position:['queued','processing','retry'].includes(j.status)?++pos:0,
+            etaSeconds:['queued','processing','retry'].includes(j.status)?pos*25:0,
+            nextRunAt:j.nextRunAt,lastError:j.lastError||'',refundReviewRequired:j.refundReviewRequired===true,createdAt:j.createdAt}));
+        res.set('Cache-Control','no-store');
+        res.json({success:true,stats:{queued,processing,retry,sentLast24h:sent,failed,averageSecondsPerOrder:25},jobs});
+    } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/gateway-queue/retry-failed', requireAdminAuth, async (req,res)=>{
+    try{
+        const id=String(req.body?.jobId||'').trim();
+        if(!id)return res.status(400).json({success:false,message:'Queue job ID is required.'});
+        const job=await GatewayQueueModel.findOneAndUpdate({_id:id,status:'failed'},
+            {$set:{status:'queued',attempts:0,nextRunAt:new Date(),lockedUntil:null,workerId:'',lastError:''}},{new:true});
+        if(!job)return res.status(404).json({success:false,message:'Failed queue job not found.'});
+        res.json({success:true,message:'Failed job returned to the queue.'});
+    }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
+app.get('/api/admin/gateway-replies', requireAdminAuth, async (req, res) => {
+    try {
+        const orders = await OrderModel.find({ gatewayReplies: { $exists: true, $ne: [] } })
+            .sort({ gatewayReplyUpdatedAt: -1 }).limit(100)
+            .select('_id targetId status gatewayReplyState gatewayReplyUpdatedAt gatewayReplies').lean();
+        const replies = [];
+        for (const order of orders) {
+            for (const reply of (order.gatewayReplies || [])) {
+                replies.push({
+                    orderId: String(order._id), targetId: order.targetId || '', orderStatus: order.status || '',
+                    classification: reply.classification || order.gatewayReplyState || 'unclassified',
+                    matchedBy: reply.matchedBy || '', ruleId: reply.ruleId || '',
+                    extracted: reply.extracted || '', extractLabel: reply.extractLabel || '',
+                    customerNoticeSent: reply.customerNoticeSent === true,
+                    receivedAt: reply.receivedAt || order.gatewayReplyUpdatedAt,
+                    text: reply.text || '', messageId: reply.messageId || ''
+                });
+            }
+        }
+        replies.sort((a, b) => new Date(b.receivedAt || 0) - new Date(a.receivedAt || 0));
+        res.set('Cache-Control', 'no-store');
+        res.json({ success: true, replies: replies.slice(0, 100) });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
 const CallCompleteModel = mongoose.model('CallCompleteService', callCompleteSchema);
 const UsedUtrModel = mongoose.model('UsedUtr', usedUtrSchema);
 const AnnouncementModel = mongoose.model('Announcement', announcementSchema);
 const PaymentModel = mongoose.model('Payment', paymentSchema);
+
+// Phase 5 — SaaS tenant registry and subscription lifecycle (control-plane foundation).
+const tenantSchema = new mongoose.Schema({
+    tenantId: { type: String, required: true, unique: true, index: true },
+    slug: { type: String, required: true, unique: true, lowercase: true, index: true },
+    name: { type: String, required: true, trim: true, maxlength: 100 },
+    ownerEmail: { type: String, required: true, lowercase: true, trim: true },
+    ownerName: { type: String, default: '', trim: true, maxlength: 100 },
+    plan: { type: String, enum: ['free','starter','growth','business'], default: 'free' },
+    status: { type: String, enum: ['trial','active','past_due','suspended','cancelled'], default: 'trial', index: true },
+    tenantKeyHash: { type: String, required: true },
+    limits: { type: mongoose.Schema.Types.Mixed, default: {} },
+    features: { type: mongoose.Schema.Types.Mixed, default: {} },
+    trialEndsAt: { type: Date, default: null },
+    currentPeriodStart: { type: Date, default: Date.now },
+    currentPeriodEnd: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now }
+}, { versionKey: false });
+
+const tenantSubscriptionSchema = new mongoose.Schema({
+    tenantId: { type: String, required: true, index: true },
+    plan: { type: String, enum: ['free','starter','growth','business'], required: true },
+    status: { type: String, enum: ['trial','active','past_due','suspended','cancelled'], default: 'trial' },
+    amount: { type: Number, default: 0, min: 0 },
+    currency: { type: String, default: 'INR' },
+    billingCycle: { type: String, enum: ['monthly','yearly'], default: 'monthly' },
+    startsAt: { type: Date, default: Date.now },
+    endsAt: { type: Date, default: null },
+    externalReference: { type: String, default: '' },
+    notes: { type: String, default: '', maxlength: 500 },
+    createdAt: { type: Date, default: Date.now }
+}, { versionKey: false });
+
+const TenantModel = mongoose.models.Tenant || mongoose.model('Tenant', tenantSchema);
+const TenantSubscriptionModel = mongoose.models.TenantSubscription || mongoose.model('TenantSubscription', tenantSubscriptionSchema);
+
+const SAAS_PLANS = {
+    free:     { label: 'Free',     monthlyPrice: 0,    maxUsers: 5,    maxOrdersPerMonth: 100,  maxAdmins: 1, features: { gatewayRouting: false, customBranding: false, apiAccess: false } },
+    starter:  { label: 'Starter',  monthlyPrice: 499,  maxUsers: 50,   maxOrdersPerMonth: 2000, maxAdmins: 2, features: { gatewayRouting: true,  customBranding: false, apiAccess: false } },
+    growth:   { label: 'Growth',   monthlyPrice: 1499, maxUsers: 250,  maxOrdersPerMonth: 15000,maxAdmins: 5, features: { gatewayRouting: true,  customBranding: true,  apiAccess: false } },
+    business: { label: 'Business', monthlyPrice: 3999, maxUsers: 2000, maxOrdersPerMonth: 100000,maxAdmins: 20,features: { gatewayRouting: true,  customBranding: true,  apiAccess: true } }
+};
+function tenantPublicView(t) {
+    return {
+        tenantId: t.tenantId, slug: t.slug, name: t.name, ownerEmail: t.ownerEmail, ownerName: t.ownerName,
+        plan: t.plan, status: t.status, limits: t.limits, features: t.features,
+        trialEndsAt: t.trialEndsAt, currentPeriodStart: t.currentPeriodStart,
+        currentPeriodEnd: t.currentPeriodEnd, createdAt: t.createdAt, updatedAt: t.updatedAt
+    };
+}
+function tenantSlug(value) {
+    return String(value || '').toLowerCase().trim().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+}
+
+
+// Phase 4: durable MongoDB-backed FIFO gateway queue.
+const gatewayQueueSchema = new mongoose.Schema({
+    tenantId: { type: String, default: 'legacy', index: true },
+    orderId: { type: String, required: true, unique: true, index: true },
+    targetId: { type: String, required: true }, targetPass: { type: String, required: true },
+    gatewayConfig: { type: mongoose.Schema.Types.Mixed, default: {} },
+    status: { type: String, enum: ['queued','processing','retry','sent','failed'], default: 'queued', index: true },
+    attempts: { type: Number, default: 0 }, maxAttempts: { type: Number, default: 4 },
+    nextRunAt: { type: Date, default: Date.now, index: true },
+    lockedUntil: { type: Date, default: null, index: true }, workerId: { type: String, default: '' },
+    lastError: { type: String, default: '' }, result: { type: mongoose.Schema.Types.Mixed, default: {} },
+    refundApplied: { type: Boolean, default: false },
+    refundReviewRequired: { type: Boolean, default: false },
+    createdAt: { type: Date, default: Date.now, index: true }, startedAt: Date, completedAt: Date
+}, { versionKey: false });
+gatewayQueueSchema.index({ status: 1, nextRunAt: 1, createdAt: 1 });
+const GatewayQueueModel = mongoose.models.GatewayQueue || mongoose.model('GatewayQueue', gatewayQueueSchema);
+const gatewayQueueLockSchema = new mongoose.Schema({ _id: String, owner: String, lockedUntil: Date }, { versionKey: false });
+const GatewayQueueLockModel = mongoose.models.GatewayQueueLock || mongoose.model('GatewayQueueLock', gatewayQueueLockSchema);
+
+
 
 // Log of every payment-recovery check (kept 30 days) - shown in Admin Panel > Payments > Auto Payment Recovery
 const reconcileLogSchema = new mongoose.Schema({
@@ -2278,6 +2691,74 @@ setTimeout(() => { runReconcile('startup run'); }, 3 * 60 * 1000);   // also sho
 const WA_ADMIN_HASH_ENV = String(process.env.WA_ADMIN_CODE_HASH || '').trim().toLowerCase();
 async function getSettingValue(key) { try { const s = await SettingModel.findOne({ key }).lean(); return s && s.value ? String(s.value) : ''; } catch (e) { return ''; } }
 async function setSettingValue(key, value) { await SettingModel.findOneAndUpdate({ key }, { value, updatedAt: new Date() }, { upsert: true }); }
+
+// Dynamic finite Reach pricing. Legacy channel prices are retained as initial defaults.
+const DEFAULT_REACH_PRICING = {
+    web: {
+        perReachPrice: 13,
+        packages: [
+            { amount: 13, coins: 1 }, { amount: 60, coins: 5 }, { amount: 115, coins: 10 },
+            { amount: 210, coins: 20 }, { amount: 400, coins: 40 }
+        ]
+    },
+    bot: {
+        perReachPrice: 20,
+        packages: [
+            { amount: 20, coins: 1, commission: 5 }, { amount: 55, coins: 3, commission: 3 },
+            { amount: 105, coins: 7, commission: 2 }, { amount: 210, coins: 15, commission: 1 }
+        ]
+    }
+};
+function cleanReachPackageSet(input, channel) {
+    if (!Array.isArray(input) || input.length < 1) throw new Error(`${channel}: add at least one finite package.`);
+    if (input.length > 30) throw new Error(`${channel}: maximum 30 packages are allowed.`);
+    const seenReaches = new Set();
+    return input.map((p, i) => {
+        const amount = Number(p && p.amount), coins = Number(p && (p.coins ?? p.reaches));
+        if (!Number.isSafeInteger(amount) || amount < 1 || amount > 10000000)
+            throw new Error(`${channel} package ${i+1}: price must be a positive whole INR amount.`);
+        if (!Number.isSafeInteger(coins) || coins < 1 || coins > 100000)
+            throw new Error(`${channel} package ${i+1}: Reach/Coin quantity must be a finite whole number from 1 to 100000.`);
+        if (seenReaches.has(coins)) throw new Error(`${channel}: duplicate package quantity (${coins} reaches).`);
+        seenReaches.add(coins);
+        const out = { amount, coins };
+        if (channel === 'Telegram Referral Bot') {
+            const commission = Number(p && p.commission);
+            out.commission = Number.isFinite(commission) ? Math.min(1000, Math.max(0, Math.round(commission * 100) / 100)) : 0;
+        }
+        return out;
+    }).sort((a,b) => a.coins - b.coins);
+}
+function cleanReachPricingSet(input, channel) {
+    const perReachPrice = Number(input && input.perReachPrice);
+    if (!Number.isFinite(perReachPrice) || perReachPrice <= 0 || perReachPrice > 1000000)
+        throw new Error(`${channel}: per-Reach price must be greater than ₹0 and at most ₹10,00,000.`);
+    return { perReachPrice: Math.round(perReachPrice * 100) / 100,
+        packages: cleanReachPackageSet(input && input.packages, channel) };
+}
+async function loadReachPricing() {
+    try {
+        const raw = await getSettingValue('reach_pricing_v1');
+        if (!raw) return;
+        const cfg = JSON.parse(raw);
+        if (cfg.web) {
+            const clean = cleanReachPricingSet(cfg.web, 'Website / WhatsApp');
+            WEB_RECHARGE_PACKAGES = clean.packages;
+            reachPricing.web = clean;
+        }
+        if (cfg.bot) {
+            const clean = cleanReachPricingSet(cfg.bot, 'Telegram Referral Bot');
+            BOT_RECHARGE_PACKAGES = clean.packages;
+            reachPricing.bot = clean;
+        }
+        debugLog('Pricing', 'Dynamic finite Reach packages loaded from MongoDB.');
+    } catch (e) { debugLog('Pricing', 'Saved Reach pricing invalid; retaining safe defaults:', e.message); }
+}
+let reachPricing = {
+    web: { perReachPrice: 13, packages: WEB_RECHARGE_PACKAGES.map(p => ({...p})) },
+    bot: { perReachPrice: 20, packages: BOT_RECHARGE_PACKAGES.map(p => ({...p})) }
+};
+
 // the code set from the Admin Panel wins; the environment variable is only the fallback
 async function getWaAdminHash() { return ((await getSettingValue('wa_admin_code_hash')) || WA_ADMIN_HASH_ENV).trim().toLowerCase(); }
 async function getBackupPasswordInfo() {
@@ -2698,7 +3179,7 @@ function cleanOfferPackages(list) {
     return list.map((x, i) => {
         const amount = Number(x && x.amount), coins = Number(x && x.coins);
         if (!Number.isInteger(amount) || amount < 1 || amount > 100000) throw new Error(`Package ${i + 1}: amount 1 se 100000 ke beech poora number hona chahiye.`);
-        if (!isFinite(coins) || coins <= 0 || coins > 100000) throw new Error(`Package ${i + 1}: coins 0 se bade hone chahiye.`);
+        if (!Number.isSafeInteger(coins) || coins < 1 || coins > 100000) throw new Error(`Package ${i + 1}: Reach/Coin quantity must be a finite whole number from 1 to 100000.`);
         const key = amount + '|' + coins;
         if (seen.has(key)) throw new Error(`Package ${i + 1}: ₹${amount} / ${coins} coins do baar likha hai.`);
         seen.add(key);
@@ -3059,12 +3540,16 @@ app.post('/api/external/v1/register-referral', requireInternalAuth, async (req, 
 });
 
 app.get('/api/external/v1/packages', (req, res) => {
-    res.json({ success: true, packages: BOT_RECHARGE_PACKAGES });
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, packages: BOT_RECHARGE_PACKAGES.map(p => ({ amount: p.amount, coins: p.coins, reaches: p.coins, commission: Number(p.commission || 0) })) });
 });
 
 app.post('/api/external/v1/approve-payment', requireInternalAuth, async (req, res) => {
     try {
         const { telegramChatId, coins } = req.body;
+        const finiteCoins = Number(coins);
+        if (!Number.isSafeInteger(finiteCoins) || finiteCoins < 1 || finiteCoins > 100000)
+            return res.status(400).json({ success: false, message: 'Only a finite whole-number Reach/Coin quantity is allowed.' });
         let user = await UserModel.findOne({ telegramChatId: String(telegramChatId) });
         if (!user) return res.json({ success: false, message: 'User not found' });
 
@@ -3074,8 +3559,8 @@ app.post('/api/external/v1/approve-payment', requireInternalAuth, async (req, re
         }
 
         const expiryDate = new Date(Date.now() + 28 * 24 * 60 * 60 * 1000);
-        user.jpwCoins = round2(user.jpwCoins + parseFloat(coins));
-        user.lastPackageCoins = parseFloat(coins);
+        user.jpwCoins = round2(user.jpwCoins + finiteCoins);
+        user.lastPackageCoins = finiteCoins;
         user.packageExpiryTime = expiryDate;
         await user.save();
 
@@ -3580,7 +4065,8 @@ app.post('/api/user/passbook', requireUser, async (req, res) => {
 });
 
 app.get('/api/packages', (req, res) => {
-    res.json({ success: true, packages: WEB_RECHARGE_PACKAGES });
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, packages: WEB_RECHARGE_PACKAGES.map(p => ({ amount: p.amount, coins: p.coins, reaches: p.coins })) });
 });
 
 app.post('/api/pay', requireUser, async (req, res) => {
@@ -3821,6 +4307,291 @@ async function findRunningOrderForId(targetId) {
 const ALREADY_IN_SERVER_MSG = '⚠️ Already in server: an order for this ID is already running. Please wait until it is completed. Nothing was charged for this request.';
 // One place that places an order (used by the web/Telegram route below AND by the WhatsApp bot).
 // Returns the same object the route sends as JSON: { success, message, remainingCoins }.
+
+async function dispatchOrderToConfiguredGateway(targetId, targetPass, orderId = '', forceDirect = false, configOverride = null) {
+    const cfg = configOverride || await getGatewayRoutingConfig();
+    const mode = cfg.mode || 'telegram';
+    const results = {};
+    const sendTelegram = async () => {
+        if (cfg.telegramEnabled === false) return false;
+        results.telegram = await forwardOrderToTargetBot(targetId, targetPass);
+        return results.telegram;
+    };
+    const sendWhatsApp = async () => {
+        if (cfg.whatsappEnabled !== true || !cfg.whatsappTarget || !wa.isConnected()) {
+            results.whatsapp = false;
+            debugLog('Gateway', 'WhatsApp dispatch unavailable: disabled, target missing, or disconnected.');
+            return false;
+        }
+        try {
+            const sentMessage = await wa.sendOrderText(cfg.whatsappTarget, `${String(targetId).trim()}\n${String(targetPass).trim()}`);
+            results.whatsapp = {
+                sent: true,
+                messageId: sentMessage && sentMessage.key ? String(sentMessage.key.id || '') : '',
+                sentAt: new Date().toISOString(),
+                destinationLast4: cfg.whatsappTarget.slice(-4)
+            };
+            debugLog('Gateway', `Order dispatched to WhatsApp destination ending ${cfg.whatsappTarget.slice(-4)}.`);
+            return true;
+        } catch (e) {
+            results.whatsapp = false;
+            debugLog('Gateway', 'WhatsApp order dispatch failed:', e.message);
+            return false;
+        }
+    };
+
+    if (cfg.dispatch === 'queue' && !forceDirect) {
+        if (!orderId) throw new Error('A saved order ID is required for queued gateway dispatch.');
+        const queued = await GatewayQueueModel.findOneAndUpdate(
+            { orderId: String(orderId) },
+            { $setOnInsert: { orderId: String(orderId), targetId: String(targetId), targetPass: String(targetPass),
+                gatewayConfig: { ...cfg }, status: 'queued', attempts: 0, maxAttempts: 4, nextRunAt: new Date(), createdAt: new Date() } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        const ahead = await GatewayQueueModel.countDocuments({
+            status: { $in: ['queued','retry','processing'] }, createdAt: { $lt: queued.createdAt }
+        });
+        const position = ahead + 1, etaSeconds = Math.max(25, position * 25);
+        await OrderModel.updateOne({ _id: orderId }, { $set: {
+            gatewayQueueJobId: String(queued._id), gatewayQueuePosition: position, gatewayQueueEtaSeconds: etaSeconds,
+            gatewayResults: { queue: { queued: true, position, etaSeconds } }
+        } });
+        debugLog('Gateway', `Order ${orderId} accepted into durable FIFO queue at position ${position}.`);
+        return { success: true, queued: true, queue: { jobId: String(queued._id), position, etaSeconds },
+            results: { queue: { queued: true, position, etaSeconds } }, mode, dispatch: 'queue' };
+    }
+    let success = false;
+    if (mode === 'whatsapp') success = await sendWhatsApp();
+    else if (mode === 'both') {
+        if (cfg.bothStrategy === 'sequential') {
+            const firstGateway = cfg.primaryGateway === 'whatsapp' ? 'whatsapp' : 'telegram';
+            const first = firstGateway === 'whatsapp' ? await sendWhatsApp() : await sendTelegram();
+            const second = firstGateway === 'whatsapp' ? await sendTelegram() : await sendWhatsApp();
+            success = first || second;
+        } else {
+            const tasks = [];
+            if (cfg.telegramEnabled !== false) tasks.push(sendTelegram());
+            if (cfg.whatsappEnabled === true) tasks.push(sendWhatsApp());
+            if (tasks.length) {
+                const sent = await Promise.all(tasks);
+                success = sent.some(Boolean);
+            }
+        }
+    } else if (mode === 'custom') {
+        const first = cfg.primaryGateway === 'whatsapp' ? await sendWhatsApp() : await sendTelegram();
+        success = first;
+        if (!first && cfg.fallbackEnabled) {
+            success = cfg.fallbackGateway === 'telegram' ? await sendTelegram() : await sendWhatsApp();
+        }
+    } else success = await sendTelegram();
+    return { success, results, mode, dispatch: cfg.dispatch || 'direct' };
+}
+
+// Phase 4: one-at-a-time FIFO worker with atomic MongoDB leases and bounded retries.
+const GATEWAY_QUEUE_WORKER_ID = require('crypto').randomBytes(8).toString('hex');
+let gatewayQueueTimer = null;
+let gatewayQueueBusy = false;
+const GATEWAY_QUEUE_RETRY_MS = [10000, 30000, 90000];
+async function processOneGatewayQueueJob() {
+    if (gatewayQueueBusy || mongoose.connection.readyState !== 1) return;
+    gatewayQueueBusy = true;
+    let job = null;
+    let globalLease = false;
+    try {
+        const now = new Date();
+        await GatewayQueueLockModel.updateOne({ _id: 'global' },
+            { $setOnInsert: { owner: '', lockedUntil: new Date(0) } }, { upsert: true });
+        const lease = await GatewayQueueLockModel.findOneAndUpdate(
+            { _id: 'global', lockedUntil: { $lt: now } },
+            { $set: { owner: GATEWAY_QUEUE_WORKER_ID, lockedUntil: new Date(Date.now()+10*60*1000) } },
+            { new: true }
+        );
+        if (!lease) return;
+        globalLease = true;
+        await GatewayQueueModel.updateMany(
+            { status: 'processing', lockedUntil: { $lt: now } },
+            { $set: { status: 'retry', nextRunAt: now, lockedUntil: null, workerId: '', lastError: 'Worker lease expired; re-queued.' } }
+        );
+        job = await GatewayQueueModel.findOneAndUpdate(
+            { status: { $in: ['queued','retry'] }, nextRunAt: { $lte: now } },
+            { $set: { status: 'processing', workerId: GATEWAY_QUEUE_WORKER_ID, lockedUntil: new Date(Date.now()+120000) },
+              $inc: { attempts: 1 } },
+            { sort: { createdAt: 1 }, new: true }
+        );
+        if (!job) return;
+        if (job.attempts === 1) job.startedAt = new Date();
+        await job.save();
+        const snapshot = { ...(job.gatewayConfig || {}), dispatch: 'direct' };
+        const result = await dispatchOrderToConfiguredGateway(job.targetId, job.targetPass, job.orderId, true, snapshot);
+        if (!result || !result.success) throw new Error('All configured gateway routes failed.');
+        job.status = 'sent'; job.result = result.results || {}; job.lastError = '';
+        job.completedAt = new Date(); job.lockedUntil = null; job.workerId = '';
+        await job.save();
+        await OrderModel.updateOne({ _id: job.orderId }, { $set: {
+            gatewayResults: result.results || {}, gatewayQueuePosition: 0, gatewayQueueEtaSeconds: 0
+        } });
+        debugLog('GatewayQueue', `Job ${job._id} dispatched.`);
+    } catch (err) {
+        if (job) {
+            job.lastError = String(err && err.message || err).slice(0,500);
+            job.lockedUntil = null; job.workerId = '';
+            if (job.attempts < Number(job.maxAttempts || 4)) {
+                job.status = 'retry';
+                job.nextRunAt = new Date(Date.now()+GATEWAY_QUEUE_RETRY_MS[Math.min(job.attempts-1,2)]);
+                await job.save();
+                debugLog('GatewayQueue', `Job ${job._id} retry ${job.attempts}/${job.maxAttempts} scheduled.`);
+            } else {
+                job.status = 'failed'; job.completedAt = new Date(); await job.save();
+                const order = await OrderModel.findById(job.orderId).lean();
+                if (order && order.status !== 'Rejected') {
+                    await OrderModel.updateOne({ _id: job.orderId }, { $set: {
+                        status: 'Rejected', adminReply: 'Gateway delivery failed after retry attempts. Refund processing requires review.',
+                        gatewayQueuePosition: 0, gatewayQueueEtaSeconds: 0
+                    } });
+                    // Do not issue an automatic wallet refund here: a process crash between
+                    // crediting and recording the refund could otherwise cause a duplicate credit.
+                    // Mark it for an authorized, auditable admin refund review instead.
+                    job.refundReviewRequired = true;
+                    job.lastError += ' | Admin refund review required.';
+                    await job.save();
+                }
+                debugLog('GatewayQueue', `Job ${job._id} exhausted retries.`);
+            }
+        } else debugLog('GatewayQueue', 'Worker error:', err.message);
+    } finally {
+        if (globalLease) {
+            try { await GatewayQueueLockModel.updateOne({ _id: 'global', owner: GATEWAY_QUEUE_WORKER_ID },
+                { $set: { owner: '', lockedUntil: new Date(0) } }); } catch (_) {}
+        }
+        gatewayQueueBusy = false;
+    }
+}
+function startGatewayQueueWorker() {
+    if (gatewayQueueTimer) return;
+    gatewayQueueTimer = setInterval(() => processOneGatewayQueueJob().catch(e => debugLog('GatewayQueue', e.message)), 2000);
+    if (gatewayQueueTimer.unref) gatewayQueueTimer.unref();
+    processOneGatewayQueueJob().catch(e => debugLog('GatewayQueue', e.message));
+}
+
+// Phase 2: receive replies from the configured external WhatsApp gateway and correlate them
+// with the correct active order. Ambiguous replies are deliberately not auto-assigned.
+const gatewayReplyChains = new Map();
+function normalizeGatewayNumber(value) { return String(value || '').replace(/\D/g, '').replace(/^0+/, ''); }
+function normalizeGatewayTarget(value) { return String(value || '').replace(/[^a-z0-9]/gi, '').replace(/^0+/, '').toLowerCase(); }
+function classifyGatewayReply(text) {
+    const t = String(text || '').toLowerCase();
+    if (/\bstatus\s*:\s*success\b|\bsuccessfully\s+(completed|reached)|\breach\s+successful\b|\bcompleted\s+successfully\b/.test(t)) return 'success_candidate';
+    if (/\bstatus\s*:\s*(fail|failed)\b|\b(account\s+locked|login\s+failed|invalid credentials|not verified|rejected)\b/.test(t)) return 'failure_candidate';
+    if (/\b(security check|processing|queued|in progress|starting reach|working on reach|verifying)\b/.test(t)) return 'in_progress';
+    return 'unclassified';
+}
+function evaluateGatewayReplyRules(text, config) {
+    const raw = String(text || '').trim();
+    const lower = raw.toLowerCase();
+    const rules = config && config.enabled && Array.isArray(config.rules) ? config.rules : [];
+    for (const rule of rules) {
+        if (!rule || rule.enabled === false || !rule.keyword) continue;
+        const keyword = String(rule.keyword).trim().toLowerCase();
+        const matched = rule.matchMode === 'exact' ? lower === keyword : lower.includes(keyword);
+        if (!matched) continue;
+        let extracted = '';
+        if (rule.extractPattern) {
+            try {
+                const m = raw.match(new RegExp(rule.extractPattern, 'i'));
+                if (m) extracted = String(m[1] || m[0] || '').slice(0, 120);
+            } catch (_) {}
+        }
+        return { classification: rule.classification || 'unclassified', ruleId: rule.id || '',
+            extracted, extractLabel: rule.extractLabel || '', customerMessage: rule.customerMessage || '' };
+    }
+    return { classification: classifyGatewayReply(raw), ruleId: '', extracted: '', extractLabel: '', customerMessage: '' };
+}
+async function sendGatewayCustomerNotice(order, evaluation, config) {
+    if (!config || config.notifyCustomer !== true || !evaluation.customerMessage || !order.telegramChatId || !CUSTOMER_BOT_TOKEN) return false;
+    const message = String(evaluation.customerMessage)
+        .replace(/\\{targetId\\}/g, String(order.targetId || ''))
+        .replace(/\\{status\\}/g, String(evaluation.classification || 'update'))
+        .replace(/\\{extracted\\}/g, String(evaluation.extracted || '')).slice(0, 900);
+    if (!message.trim()) return false;
+    try {
+        const bot = new TelegramBot(CUSTOMER_BOT_TOKEN, { polling: false });
+        await bot.sendMessage(String(order.telegramChatId), message);
+        return true;
+    } catch (e) { debugLog('Gateway', 'Customer status notice could not be delivered:', e.message); return false; }
+}
+async function handleExternalGatewayWhatsAppReply({ from, jid, text, raw }) {
+    if (mongoose.connection.readyState !== 1 || !String(text || '').trim()) return;
+    const cfg = await getGatewayRoutingConfig();
+    if (!cfg.whatsappEnabled || !cfg.whatsappTarget) return;
+    const incomingNumber = normalizeGatewayNumber(from || (jid || '').split('@')[0]);
+    const configuredNumber = normalizeGatewayNumber(cfg.whatsappTarget);
+    if (!incomingNumber || incomingNumber !== configuredNumber) return;
+
+    const msgId = String(raw && raw.key && raw.key.id || '');
+    const rawText = String(text).trim().slice(0, 4000);
+    const normText = normalizeGatewayTarget(rawText);
+    const active = await OrderModel.find({
+        status: { $in: ['Pending', 'Accepted', 'In Progress'] },
+        $or: [
+            { 'gatewayResults.whatsapp.sent': true },
+            { 'gatewayResults.whatsapp': true }
+        ]
+    }).sort({ createdAt: 1 });
+    if (!active.length) return;
+
+    let order = active.find(o => {
+        const id = normalizeGatewayTarget(o.targetId);
+        return id && normText.includes(id);
+    });
+    let matchedBy = order ? 'target_id_in_reply' : '';
+
+    // If the provider omits the target ID, only correlate when exactly one recently dispatched
+    // WhatsApp order is eligible. Never guess between multiple customers' orders.
+    if (!order) {
+        const recent = active.filter(o => {
+            const meta = o.gatewayResults && o.gatewayResults.whatsapp;
+            const sentAt = meta && typeof meta === 'object' && meta.sentAt ? new Date(meta.sentAt).getTime() : new Date(o.createdAt).getTime();
+            return Date.now() - sentAt <= 45 * 60 * 1000;
+        });
+        if (recent.length === 1) { order = recent[0]; matchedBy = 'single_recent_whatsapp_order'; }
+    }
+    if (!order) {
+        debugLog('Gateway', `External WhatsApp reply not matched safely; active eligible orders: ${active.length}.`);
+        return;
+    }
+    if (msgId && Array.isArray(order.gatewayReplies) && order.gatewayReplies.some(r => r && r.messageId === msgId)) return;
+
+    const replyRulesConfig = await getGatewayReplyRules();
+    const evaluation = evaluateGatewayReplyRules(rawText, replyRulesConfig);
+    const replyRecord = {
+        messageId: msgId, from: incomingNumber, receivedAt: new Date(), matchedBy,
+        classification: evaluation.classification, ruleId: evaluation.ruleId,
+        extracted: evaluation.extracted, extractLabel: evaluation.extractLabel,
+        customerNoticeText: evaluation.customerMessage, customerNoticeSent: false, text: rawText
+    };
+    order.gatewayReplies = Array.isArray(order.gatewayReplies) ? order.gatewayReplies : [];
+    order.gatewayReplies.push(replyRecord);
+    order.gatewayReplies = order.gatewayReplies.slice(-25);
+    order.gatewayReplyState = evaluation.classification;
+    order.gatewayReplyUpdatedAt = new Date();
+    await order.save();
+    const noticeSent = await sendGatewayCustomerNotice(order, evaluation, replyRulesConfig);
+    if (noticeSent && msgId) {
+        await OrderModel.updateOne({ _id: order._id }, { $set: { 'gatewayReplies.$[reply].customerNoticeSent': true } },
+            { arrayFilters: [{ 'reply.messageId': msgId }] });
+    }
+    debugLog('Gateway', `External WhatsApp reply recorded for order ${String(order._id)} (${evaluation.classification}; rule=${evaluation.ruleId || 'default'}; ${matchedBy}).`);
+}
+
+wa.onMessage(async (message) => {
+    // Serialize gateway reply processing to prevent two fast updates racing the same order.
+    const job = (gatewayReplyChains.get('external') || Promise.resolve())
+        .then(() => handleExternalGatewayWhatsAppReply(message))
+        .catch(e => debugLog('Gateway', 'External WhatsApp reply handler failed:', e.message));
+    gatewayReplyChains.set('external', job);
+    await job;
+});
+
 async function placeOrder({ telegramChatId, targetId, targetPass, isPriority }) {
     let lockKey = null;
     try {
@@ -3841,7 +4612,8 @@ async function placeOrder({ telegramChatId, targetId, targetPass, isPriority }) 
         const user = await spendOrFree(telegramChatId);
         if (!user) return { success: false, message: 'Insufficient Coins!' };
 
-        const newOrder = await OrderModel.create({ telegramChatId: String(telegramChatId), targetId: cleanId, targetPass: cleanPass, isPriority: !!isPriority });
+        const routeConfig = await getGatewayRoutingConfig();
+        const newOrder = await OrderModel.create({ telegramChatId: String(telegramChatId), targetId: cleanId, targetPass: cleanPass, isPriority: !!isPriority, gatewayMode: routeConfig.mode || 'telegram', gatewayDispatch: routeConfig.dispatch || 'direct' });
         await notifyAdminAndUser(newOrder, `🌐 **New Reach Order**\n🆔 ID: \`${newOrder._id}\`\n🎯 Target: \`${cleanId}\``);
 
         sendLogToGoogleSheet({
@@ -3852,7 +4624,14 @@ async function placeOrder({ telegramChatId, targetId, targetPass, isPriority }) 
             status: 'Pending'
         });
 
-        const sent = await forwardOrderToTargetBot(cleanId, cleanPass);
+        const dispatchResult = await dispatchOrderToConfiguredGateway(cleanId, cleanPass, String(newOrder._id));
+        const sent = !!dispatchResult.success;
+        // Queue metadata was written atomically by the enqueue operation. Avoid saving
+        // the stale in-memory Order document here, which could overwrite a fast worker result.
+        if (!dispatchResult.queued) {
+            newOrder.gatewayResults = dispatchResult.results || {};
+            await newOrder.save();
+        }
         if (!sent) {
             await refundCoinTo(String(telegramChatId));
             newOrder.status = 'Rejected';
@@ -3863,8 +4642,13 @@ async function placeOrder({ telegramChatId, targetId, targetPass, isPriority }) 
         }
         // 🔧 FIX: the order was handed to the service, so it must not keep showing "Pending".
         // Only set this if no reply has already arrived and moved it further.
-        await OrderModel.updateOne({ _id: newOrder._id, status: 'Pending' }, { $set: { status: 'In Progress', adminReply: plainText(buildCustomerMessage('received', { targetId: cleanId })) } });
-        return { success: true, message: 'Order submitted!', remainingCoins: user.jpwCoins, selected: !!selInfo };   // selected users never see coins
+        await OrderModel.updateOne({ _id: newOrder._id, status: 'Pending' }, { $set: {
+            status: 'In Progress',
+            adminReply: dispatchResult.queued
+                ? `Your order is safely queued for gateway processing. Estimated wait: about ${Math.max(1, Math.ceil((dispatchResult.queue?.etaSeconds || 25) / 60))} minute(s).`
+                : plainText(buildCustomerMessage('received', { targetId: cleanId }))
+        } });
+        return { success: true, message: dispatchResult.queued ? `Order accepted into queue (position ${dispatchResult.queue?.position || 1}). Estimated wait: about ${Math.max(1, Math.ceil((dispatchResult.queue?.etaSeconds || 25) / 60))} minute(s).` : 'Order submitted!', remainingCoins: user.jpwCoins, selected: !!selInfo };   // selected users never see coins
     } finally { if (lockKey) orderLocks.delete(lockKey); }
 }
 app.post('/api/order', requireUser, async (req, res) => {

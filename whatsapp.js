@@ -432,6 +432,17 @@ module.exports = function createWhatsApp({ mongoose, debugLog: baseLog, name = '
         await sendRaw(jid, { text: withRef(text) });
     }
 
+    // Machine-to-machine gateway send: preserve the exact payload (no customer-facing Ref footer).
+    async function sendOrderText(to, text) {
+        if (!sock || st.state !== 'connected') throw new Error('WhatsApp is not connected.');
+        const digits = String(to || '').replace(/\D/g, '');
+        if (digits.length < 8 || digits.length > 15) throw new Error('Number must include country code.');
+        const jid = `${digits}@s.whatsapp.net`;
+        const check = await sock.onWhatsApp(jid);
+        if (check && check[0] && check[0].exists === false) throw new Error('This number is not on WhatsApp.');
+        return sendRaw(jid, { text: String(text == null ? '' : text) });
+    }
+
     // Reply inside an existing chat (works for @lid and @s.whatsapp.net). Shows "typing..." and waits a moment - looks human, lowers ban risk.
     async function reply(jid, text) {
         if (!sock || st.state !== 'connected') throw new Error('WhatsApp is not connected.');
@@ -489,5 +500,5 @@ module.exports = function createWhatsApp({ mongoose, debugLog: baseLog, name = '
     process.once('SIGTERM', () => gracefulStop('SIGTERM'));
     process.once('SIGINT', () => gracefulStop('SIGINT'));
 
-    return { start, autoStart, logout, sendText, reply, sendImage, sendDocument, deleteMessage, isConnected: () => st.state === 'connected', getStatus, onMessage: (fn) => handlers.push(fn) };
+    return { start, autoStart, logout, sendText, sendOrderText, reply, sendImage, sendDocument, deleteMessage, isConnected: () => st.state === 'connected', getStatus, onMessage: (fn) => handlers.push(fn) };
 };
