@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>
+/* Adds the login token to every /api/ call. If the server says the session expired, the saved login is cleared and the page reloads to the login screen. */
+(function () {
+  var _f = window.fetch;
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : ((input && input.url) || '');
+    var isApi = url.indexOf('/api/') === 0;
+    if (isApi) {
+      try {
+        var t = localStorage.getItem('jpw_token');
+        if (t) { init = Object.assign({}, init); init.headers = Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + t }); }
+      } catch (e) {}
+    }
+    return _f.call(this, input, init).then(function (r) {
+      try {
+        if (isApi && r.ok) sessionStorage.removeItem('jpw_reload');
+        if (isApi && r.status === 503 && r.headers.get('X-Maintenance')) { location.reload(); } // maintenance switched on: server now serves the maintenance page
+        if (isApi && r.status === 401 && !sessionStorage.getItem('jpw_reload')) {
+          ['jpw_token', 'jpw_chat_id', 'jpw_user_name', 'cid', 'cpass', 'chatid'].forEach(function (k) { localStorage.removeItem(k); });
+          sessionStorage.setItem('jpw_reload', '1');
+          location.reload();
+        }
+      } catch (e) {}
+      return r;
+    });
+  };
+})();
+</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JPW Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        :root { --bg:#0a1020; --card:#111a2c; --line:#1f2b44; --text:#e8eefc; --muted:#8fa0bf; --accent:#14b8a6; }
+        body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+        .card { background: var(--card); border: 1px solid var(--line); }
+        input, textarea, select { background: #0b1324; border: 1px solid var(--line); color: var(--text); }
+        input::placeholder { color: #5b6a88; }
+        input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(20,184,166,.22); }
+        .mono { font-family: inherit; }
+        .hidden { display: none !important; }
+        ::-webkit-scrollbar { height:6px; width:6px; } ::-webkit-scrollbar-thumb { background:#1f2b44; border-radius:8px; }
+    </style>
+</head>
+<body class="p-4 flex items-center justify-center min-h-screen">
+
+<div class="w-full max-w-md card p-6 rounded-2xl relative overflow-hidden">
+
+    <!-- 🕒 Live IST Digital Clock Badge -->
+    <div class="flex justify-between items-center mb-3">
+        <div>
+            <h2 class="text-xl font-black text-white ">JPW Portal</h2>
+            <p class="text-[9px] text-slate-400  ">Customer portal</p>
+        </div>
+    </div>
+
+    <div class="mb-4 p-3 bg-amber-950/40 border border-amber-500/50 rounded-2xl  text-left relative overflow-hidden">
+        <div class="absolute -right-4 -bottom-4 text-4xl opacity-10">⚠️</div>
+        <div class="flex items-center gap-2 mb-1">
+            <span class="bg-amber-500 text-slate-950 font-black text-[9px] px-2 py-0.5 rounded-full   ">IMPORTANT NOTICE</span>
+            <span class="text-[9px] text-amber-400 ">LIVE UPDATE</span>
+        </div>
+        <p id="liveNoticeText" class="text-[11px] text-amber-200 leading-relaxed ">
+            📌 काम शुरू करने से पहले वर्कआर्डर और मैप ज़रूर खुला रखें।
+        </p>
+    </div>
+
+    <div id="auth-container">
+        <div class="flex gap-2 mb-4 bg-slate-950 p-1.5 rounded-2xl border border-slate-900/50">
+            <button onclick="switchTab('login')" id="tabL" class="flex-1 py-2.5 rounded-xl font-bold text-xs bg-teal-600 hover:bg-teal-500 text-white transition ">LOGIN</button>
+            <button onclick="switchTab('register')" id="tabR" class="flex-1 py-2.5 rounded-xl font-bold text-xs text-slate-400 transition">REGISTER</button>
+        </div>
+        
+        <div id="loginForm">
+            <div class="mb-3">
+                <label class="block text-[10px] text-teal-400 mb-1  ">Custom ID (10-Digit)</label>
+                <input type="text" id="logId" placeholder="Login ID" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-900/60 text-xs text-teal-300 text-center ">
+            </div>
+            <div class="mb-4">
+                <label class="block text-[10px] text-teal-400 mb-1  ">Access Password</label>
+                <input type="password" id="logPass" placeholder="••••••••" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-900/60 text-xs text-teal-300 text-center ">
+            </div>
+            <button onclick="appLogin()" class="w-full py-3 bg-teal-600 hover:bg-teal-500 text-white font-extrabold rounded-xl  transition text-xs  ">INITIALIZE LOGIN</button>
+        </div>
+
+        <div id="regForm" class="hidden">
+            <div class="mb-3">
+                <label class="block text-[10px] text-teal-400 mb-1  ">Engineer Name</label>
+                <input type="text" id="regName" placeholder="Full name" class="w-full p-2.5 rounded-xl bg-slate-900 border border-slate-900/60 text-xs text-teal-300 text-center ">
+            </div>
+            <div class="mb-3">
+                <label class="block text-[10px] text-teal-400 mb-1  ">Choose 10-Digit ID</label>
+                <input type="text" id="regId" placeholder="Choose a login ID" class="w-full p-2.5 rounded-xl bg-slate-900 border border-slate-900/60 text-xs text-teal-300 text-center ">
+            </div>
+            <div class="mb-4">
+                <label class="block text-[10px] text-teal-400 mb-1  ">Security Password</label>
+                <input type="password" id="regPass" placeholder="••••••••" class="w-full p-2.5 rounded-xl bg-slate-900 border border-slate-900/60 text-xs text-teal-300 text-center ">
+            </div>
+            <button onclick="appRegister()" class="w-full py-3 bg-teal-600 hover:bg-teal-500 text-white font-extrabold rounded-xl  transition text-xs  ">REGISTER NODE</button>
+        </div>
+    </div>
+
+    <div id="app-dashboard" class="hidden">
+        <div class="mb-4 p-4 bg-slate-900/80 rounded-2xl border border-slate-500/30 text-center relative">
+            <div class="absolute top-2 right-3 flex items-center gap-1">
+                <span class="w-2 h-2 rounded-full bg-teal-400 "></span>
+                <span class="text-[9px] text-teal-300">ONLINE</span>
+            </div>
+            <p class="text-[10px] text-slate-400">NODE USER</p>
+            <p id="dName" class="text-sm font-black text-teal-200 mt-0.5"></p>
+            <p class="text-xs font-bold text-amber-400 mt-1 bg-amber-500/10 py-1 px-3 rounded-full inline-block border border-amber-500/20">🪙 COINS: <span id="dCoins">0.00</span></p>
+            
+            <div class="grid grid-cols-5 gap-1 mt-3">
+                <button onclick="switchSubTab('services')" id="btnS" class="py-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg text-[9px] font-bold transition ">SERVICES</button>
+                <button onclick="switchSubTab('packages')" id="btnP" class="py-2 bg-slate-900 text-teal-400 border border-teal-900/60 rounded-lg text-[9px] font-bold transition ">PLANS</button>
+                <button onclick="switchSubTab('passbook')" id="btnL" class="py-2 bg-slate-900 text-teal-400 border border-teal-900/60 rounded-lg text-[9px] font-bold transition ">LEDGER</button>
+                <button onclick="switchSubTab('bonus')" id="btnB" class="py-2 bg-slate-900 text-teal-400 border border-teal-900/60 rounded-lg text-[9px] font-bold transition ">BONUS</button>
+                <button onclick="switchSubTab('status')" id="btnT" class="py-2 bg-slate-900 text-teal-400 border border-teal-900/60 rounded-lg text-[9px] font-bold transition ">STATUS</button>
+            </div>
+
+            <div class="flex gap-2 mt-3">
+                <a href="https://chat.whatsapp.com/DEWvYKtdJAaAlHghem3puj?s=cl&p=a&ilr=4" target="_blank" class="w-full py-2 bg-slate-950/60 hover:bg-slate-900 text-slate-300 border border-slate-500/40 rounded-xl text-xs font-bold flex items-center justify-center transition">💬 JOIN WHATSAPP GROUP</a>
+            </div>
+            <button onclick="logout()" class="mt-2 text-[10px] text-red-400 hover:underline  ">Disconnect Session</button>
+        </div>
+
+        <div id="tabServices" class="space-y-3 mb-2">
+            <!-- Regular Reach Order -->
+            <div class="p-3.5 bg-slate-900 rounded-2xl border border-teal-500/30">
+                <h3 class="text-xs font-bold text-teal-400  mb-2">⚡ SUBMIT REACH ORDER (1 Coin)</h3>
+                <input type="text" id="targetId" placeholder="Target ID" class="w-full p-2.5 mb-2 rounded-lg bg-slate-950 border border-teal-900/60 text-xs text-teal-300 text-center ">
+                <input type="password" id="targetPass" placeholder="Target Password" class="w-full p-2.5 mb-2 rounded-lg bg-slate-950 border border-teal-900/60 text-xs text-teal-300 text-center ">
+                <button onclick="submitReachOrder()" class="w-full py-2 bg-teal-600 hover:bg-teal-500 rounded-lg text-xs font-bold text-white transition ">EXECUTE REACH ORDER</button>
+            </div>
+
+            <!-- SR Service -->
+            <div class="p-3.5 bg-slate-900 rounded-2xl border border-slate-500/30">
+                <h3 class="text-xs font-bold text-slate-400  mb-2">📌 SUBMIT SR SERVICE (1 Coin)</h3>
+                <input type="text" id="srName" placeholder="Customer Name" class="w-full p-2.5 mb-2 rounded-lg bg-slate-950 border border-teal-900/60 text-xs text-slate-300 text-center ">
+                <input type="text" id="srMobile" placeholder="Mobile Number" class="w-full p-2.5 mb-2 rounded-lg bg-slate-950 border border-teal-900/60 text-xs text-slate-300 text-center ">
+                <input type="text" id="srLandline" placeholder="Landline Number" class="w-full p-2.5 mb-2 rounded-lg bg-slate-950 border border-teal-900/60 text-xs text-slate-300 text-center ">
+                <button onclick="submitSrOrder()" class="w-full py-2 bg-slate-600 hover:bg-slate-500 rounded-lg text-xs font-bold text-white transition ">EXECUTE SR ORDER</button>
+            </div>
+
+            <!-- 🚧 Call Complete Service (COMING SOON) -->
+            <div class="p-3.5 bg-slate-950/70 rounded-2xl border border-dashed border-teal-500/40 relative opacity-75">
+                <div class="absolute top-2 right-2 bg-teal-500/20 text-teal-400 border border-teal-500/40 text-[9px] font-bold px-2 py-0.5 rounded-full   ">COMING SOON</div>
+                <h3 class="text-xs font-bold text-teal-400  mb-1">📞 CALL COMPLETE SERVICE</h3>
+                <p class="text-[10px] text-teal-600 mb-2">First Call (5c) | Second Call (5c) | Hold (3c)</p>
+                <input type="text" disabled placeholder="Disabled - Coming Soon" class="w-full p-2 mb-2 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-600 text-center  cursor-not-allowed">
+                <button disabled class="w-full py-2 bg-slate-900 text-slate-600 rounded-lg text-xs font-bold  cursor-not-allowed">ORDERS DISABLED</button>
+            </div>
+        </div>
+
+        <div id="tabPackages" class="hidden space-y-2 mb-2">
+            <div id="offers-section"></div>
+            <div id="webPackagesList" class="space-y-2">
+                <p class="text-center text-[10px] text-teal-400 py-3 ">Loading original plans...</p>
+            </div>
+        </div>
+
+        <div id="tabPassbook" class="hidden mb-2">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="text-[10px] font-bold text-teal-400  ">TRANSACTION STATEMENT</h3>
+                <button onclick="fetchPassbook()" class="text-[10px] text-teal-300 underline">🔄 Refresh</button>
+            </div>
+            <div id="passbookList" class="space-y-2 max-h-[220px] overflow-y-auto pr-1"></div>
+        </div>
+
+        <div id="tabBonus" class="hidden p-4 bg-slate-900 rounded-2xl border border-slate-500/30 text-center mb-2">
+            <h3 class="text-sm font-bold text-slate-400 mb-1">🎁 DAILY REWARD BONUS</h3>
+            <p class="text-[11px] text-slate-600 mb-4">Claim free random coins once every 24 hours.</p>
+            <button onclick="claimBonus()" class="w-full py-3 bg-slate-600 hover:bg-slate-500 text-white font-bold rounded-xl text-xs transition  ">CLAIM DAILY BONUS</button>
+        </div>
+
+        <div id="tabStatus" class="hidden mb-2">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="text-[10px] font-bold text-teal-400  ">LIVE ORDER TRACKER</h3>
+                <button onclick="fetchStatus()" class="text-[10px] text-teal-300 underline">🔄 Refresh</button>
+            </div>
+            <div id="statusList" class="space-y-2 max-h-[220px] overflow-y-auto pr-1"></div>
+        </div>
+    </div>
+</div>
+
+<div id="orderPlacedModal" class="hidden fixed inset-0 bg-slate-950/95 flex justify-center items-center z-50 p-4">
+    <div class="bg-slate-950 border border-teal-500 p-5 rounded-2xl w-full max-w-sm text-center ">
+        <div class="w-12 h-12 bg-teal-500/20 text-teal-400 rounded-full flex items-center justify-center mx-auto mb-3 text-xl border border-teal-500/50">🚀</div>
+        <h3 class="text-base font-black text-teal-400  mb-1">Order Placed Successfully!</h3>
+        <p class="text-[11px] text-teal-600 mb-4">Your order has been queued and sent to server bridge.</p>
+        
+        <div class="bg-slate-900 p-3 rounded-xl border border-teal-900/60 text-left text-xs mb-4 space-y-1">
+            <p><b>Target:</b> <span id="placedTarget" class="text-teal-300">---</span></p>
+            <p><b>Status:</b> <span class="text-amber-400 font-bold">Pending / In Progress</span></p>
+        </div>
+
+        <button onclick="closeOrderPlacedModal()" class="w-full py-2.5 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl text-xs  transition">VIEW LIVE STATUS</button>
+    </div>
+</div>
+
+<div id="orderCompletedModal" class="hidden fixed inset-0 bg-slate-950/95 flex justify-center items-center z-50 p-4">
+    <div class="bg-slate-950 border border-teal-500 p-5 rounded-2xl w-full max-w-sm text-center ">
+        <div class="w-12 h-12 bg-teal-500/20 text-teal-400 rounded-full flex items-center justify-center mx-auto mb-3 text-xl border border-teal-500/50">🎉</div>
+        <h3 class="text-base font-black text-teal-400  mb-1">Order Completed!</h3>
+        <p class="text-[11px] text-teal-600 mb-4">Your reach request has been successfully executed.</p>
+        
+        <div class="bg-slate-900 p-3 rounded-xl border border-teal-900/60 text-left text-xs mb-4 space-y-1">
+            <p><b>Target / Name:</b> <span id="completedTargetName" class="text-teal-300">---</span></p>
+            <p><b>Status:</b> <span class="text-emerald-400 font-bold">SUCCESSFULLY COMPLETED</span></p>
+        </div>
+
+        <button onclick="closeOrderCompletedModal()" class="w-full py-2.5 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl text-xs  transition">OK, AWESOME</button>
+    </div>
+</div>
+
+<script>
+    let currentUser = null;
+    let backgroundSyncInterval = null;
+    let knownCompletedOrderIds = new Set();
+
+    // 🕒 Live IST Clock
+    function updateISTClock() {
+        const clockElem = document.getElementById('liveClock');
+        if (clockElem) {
+            const options = {
+                timeZone: 'Asia/Kolkata',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: true
+            };
+            clockElem.innerText = new Intl.DateTimeFormat('en-IN', options).format(new Date());
+        }
+    }
+    setInterval(updateISTClock, 1000);
+    updateISTClock();
+
+    const terminalLogs = [
+        "> [CONNECT] Multiverse secure gateway established...",
+        "> [STATUS] Bot bridge active & listening...",
+        "> [PROCESS] Scanning target parameters...",
+        "> [READY] System primed for execution."
+    ];
+    let logIndex = 0;
+    setInterval(() => {
+        const termElem = document.getElementById('terminalText');
+        if(termElem) {
+            termElem.innerHTML = terminalLogs[logIndex];
+            logIndex = (logIndex + 1) % terminalLogs.length;
+        }
+    }, 3500);
+
+    async function loadLiveAnnouncement() {
+        try {
+            const res = await fetch('/api/announcement');
+            const data = await res.json();
+            if (data.success && data.message) {
+                document.getElementById('liveNoticeText').innerText = data.message;
+            }
+        } catch (e) {}
+    }
+
+    async function loadWebPackages() {
+        try {
+            const res = await fetch('/api/packages');
+            const data = await res.json();
+            if(data.success && data.packages) {
+                let html = '';
+                data.packages.forEach(p => {
+                    html += `<div class="p-3 bg-slate-900 rounded-xl border border-teal-500/30 flex justify-between items-center text-xs">
+                        <div><span class="font-bold text-teal-400">${p.coins} Coins</span><p class="text-[10px] text-teal-700">Price: ₹${p.amount}</p></div>
+                        <button onclick="initiatePayment(${p.amount}, ${p.coins})" class="px-3 py-1.5 bg-teal-500 hover:bg-teal-400 rounded-lg text-slate-950 font-bold transition ">BUY</button>
+                    </div>`;
+                });
+                document.getElementById('webPackagesList').innerHTML = html;
+            }
+        } catch(e) {}
+    }
+
+    window.onload = async () => {
+        loadLiveAnnouncement();
+        loadWebPackages();
+        setInterval(loadLiveAnnouncement, 20000);
+
+        const urlParams = new URLSearchParams(window.location.search);
+        if(urlParams.get('payment') === 'success') {
+            await verifyInstantPayment(urlParams.get('telegramChatId'), urlParams.get('coins'), urlParams.get('order_id'));
+        }
+
+        localStorage.removeItem('cpass'); // old versions stored the plain password here - wipe it
+        const savedToken = localStorage.getItem('jpw_token');
+        const savedChat = localStorage.getItem('chatid');
+        if(savedToken && savedChat) {
+            try {
+                const res = await fetch('/api/user/status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: savedChat }) });
+                const data = await res.json();
+                if(data.success && data.user) { currentUser = data.user; showDash(currentUser); }
+            } catch(e) {}
+        }
+    };
+
+    async function verifyInstantPayment(telegramChatId, coins, orderId) {
+        try {
+            const res = await fetch('/api/verify-instant', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId, coins, order_id: orderId }) });
+            const data = await res.json();
+            if(data.success) {
+                alert(`🎉 Payment Successful! Added ${coins} JPW Coins.`);
+                window.history.replaceState({}, document.title, window.location.pathname);
+            } else if(data.message && data.message !== 'Already credited') {
+                alert('Payment status: ' + data.message + '. If money was deducted, wait 1-2 minutes and reopen this page.');
+            }
+        } catch(e) {}
+    }
+
+    function switchTab(t) {
+        document.getElementById('loginForm').classList.toggle('hidden', t !== 'login');
+        document.getElementById('regForm').classList.toggle('hidden', t !== 'register');
+    }
+
+    function switchSubTab(sub) {
+        ['Services', 'Packages', 'Passbook', 'Bonus', 'Status'].forEach(s => {
+            document.getElementById('tab' + s).classList.add('hidden');
+        });
+        document.getElementById('tab' + sub.charAt(0).toUpperCase() + sub.slice(1)).classList.remove('hidden');
+        if(sub === 'passbook') fetchPassbook();
+        if(sub === 'status') fetchStatus();
+    }
+
+    async function appLogin() {
+        const customId = document.getElementById('logId').value.trim();
+        const password = document.getElementById('logPass').value.trim();
+        if(!customId || !password) return alert('ID aur Password dono daaliye.');
+        try {
+            const res = await fetch('/api/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ customId, password }) });
+            const data = await res.json();
+            if(data.success) {
+                localStorage.setItem('cid', data.user.customId);
+                if (data.token) localStorage.setItem('jpw_token', data.token);
+                localStorage.setItem('chatid', data.user.telegramChatId);
+                showDash(data.user);
+            } else { alert(data.message || data.error || 'Login failed'); }
+        } catch(e) { alert('Network error. Please try again.'); }
+    }
+
+    async function appRegister() {
+        const name = document.getElementById('regName').value.trim();
+        const customId = document.getElementById('regId').value.trim();
+        const password = document.getElementById('regPass').value.trim();
+        if(!customId || !password) return alert('ID aur Password dono daaliye.');
+        try {
+            const res = await fetch('/api/register', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ customId, password, name }) });
+            const data = await res.json();
+            alert(data.message || data.error || 'Registration failed');
+            if(data.success) switchTab('login');
+        } catch(e) { alert('Network error. Please try again.'); }
+    }
+
+    function showDash(user) {
+        currentUser = user;
+        document.getElementById('auth-container').classList.add('hidden');
+        document.getElementById('app-dashboard').classList.remove('hidden');
+        document.getElementById('dName').innerText = user.customId || user.name;
+        document.getElementById('dCoins').innerText = user.jpwCoins.toFixed(2);
+        localStorage.setItem('chatid', user.telegramChatId);
+
+        initialLoadCompletedOrders();
+
+        if (backgroundSyncInterval) clearInterval(backgroundSyncInterval);
+        backgroundSyncInterval = setInterval(backgroundAutoSync, 5000);
+    }
+
+    async function initialLoadCompletedOrders() {
+        if (!currentUser || !currentUser.telegramChatId) return;
+        try {
+            const res = await fetch('/api/app/check-status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId }) });
+            const data = await res.json();
+            if(data.success) {
+                if(data.regularOrders) {
+                    data.regularOrders.forEach(o => { if(o.status === 'Completed') knownCompletedOrderIds.add(o._id); });
+                }
+                if(data.srOrders) {
+                    data.srOrders.forEach(s => { if(s.status === 'Completed') knownCompletedOrderIds.add(s._id); });
+                }
+            }
+        } catch(e) {}
+    }
+
+    async function backgroundAutoSync() {
+        if (!currentUser || !currentUser.telegramChatId) return;
+        try {
+            const res = await fetch('/api/user/status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId }) });
+            const data = await res.json();
+            if (data.success && data.user) {
+                currentUser.jpwCoins = data.user.jpwCoins;
+                document.getElementById('dCoins').innerText = currentUser.jpwCoins.toFixed(2);
+            }
+
+            const statusRes = await fetch('/api/app/check-status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId }) });
+            const statusData = await statusRes.json();
+            
+            if(statusData.success) {
+                if(statusData.regularOrders) {
+                    statusData.regularOrders.forEach(o => {
+                        if(o.status === 'Completed' && !knownCompletedOrderIds.has(o._id)) {
+                            knownCompletedOrderIds.add(o._id);
+                            document.getElementById('completedTargetName').innerText = `Reach: ${o.targetId}`;
+                            document.getElementById('orderCompletedModal').classList.remove('hidden');
+                        }
+                    });
+                }
+                if(statusData.srOrders) {
+                    statusData.srOrders.forEach(s => {
+                        if(s.status === 'Completed' && !knownCompletedOrderIds.has(s._id)) {
+                            knownCompletedOrderIds.add(s._id);
+                            document.getElementById('completedTargetName').innerText = `SR: ${s.customerName}`;
+                            document.getElementById('orderCompletedModal').classList.remove('hidden');
+                        }
+                    });
+                }
+            }
+
+            const statusTab = document.getElementById('tabStatus');
+            if (statusTab && !statusTab.classList.contains('hidden')) {
+                fetchStatus(true);
+            }
+        } catch (e) {}
+    }
+
+    function logout() {
+        if (backgroundSyncInterval) clearInterval(backgroundSyncInterval);
+        localStorage.clear();
+        location.reload();
+    }
+
+    async function claimBonus() {
+        const res = await fetch('/api/claim-daily-bonus', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId }) });
+        const data = await res.json();
+        if(data.success) {
+            alert(`🎉 Daily Bonus Claimed! +${data.randomBonus} Coins`);
+            currentUser.jpwCoins = data.user.jpwCoins;
+            document.getElementById('dCoins').innerText = currentUser.jpwCoins.toFixed(2);
+        } else {
+            alert(data.message);
+        }
+    }
+
+    // 💳 Updated initiatePayment to redirect to Private Payment Gateway checkoutUrl
+    async function initiatePayment(amount, coins) {
+        try {
+            const res = await fetch('/api/pay', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId, amount, coins, source: 'app' }) });
+            const data = await res.json();
+            if(data.success && data.checkoutUrl) {
+                window.location.href = data.checkoutUrl;
+            } else { alert(data.message || 'Payment initialization failed'); }
+        } catch(e) { alert('Connection error during payment setup.'); }
+    }
+
+    async function submitReachOrder() {
+        const targetId = document.getElementById('targetId').value.trim();
+        const targetPass = document.getElementById('targetPass').value.trim();
+        if(!targetId || !targetPass) return alert('Fill all fields!');
+
+        const res = await fetch('/api/order', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId, targetId, targetPass }) });
+        const data = await res.json();
+        if(data.success) {
+            document.getElementById('targetId').value = '';
+            document.getElementById('targetPass').value = '';
+            currentUser.jpwCoins = data.remainingCoins;
+            document.getElementById('dCoins').innerText = currentUser.jpwCoins.toFixed(2);
+
+            document.getElementById('placedTarget').innerText = targetId;
+            document.getElementById('orderPlacedModal').classList.remove('hidden');
+        } else { alert(data.message); }
+    }
+
+    async function submitSrOrder() {
+        const customerName = document.getElementById('srName').value.trim();
+        const mobileNumber = document.getElementById('srMobile').value.trim();
+        const landlineNumber = document.getElementById('srLandline').value.trim();
+        if(!customerName || !mobileNumber) return alert('Fill required fields!');
+
+        const res = await fetch('/api/sr-submit', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId, customerName, mobileNumber, landlineNumber }) });
+        const data = await res.json();
+        if(data.success) {
+            document.getElementById('srName').value = '';
+            document.getElementById('srMobile').value = '';
+            document.getElementById('srLandline').value = '';
+            currentUser.jpwCoins = data.remainingCoins;
+            document.getElementById('dCoins').innerText = currentUser.jpwCoins.toFixed(2);
+
+            document.getElementById('placedTarget').innerText = `SR: ${customerName}`;
+            document.getElementById('orderPlacedModal').classList.remove('hidden');
+        } else { alert(data.message); }
+    }
+
+    function closeOrderPlacedModal() { document.getElementById('orderPlacedModal').classList.add('hidden'); switchSubTab('status'); }
+    function closeOrderCompletedModal() { document.getElementById('orderCompletedModal').classList.add('hidden'); switchSubTab('status'); }
+
+    async function fetchPassbook() {
+        const res = await fetch('/api/user/passbook', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId }) });
+        const data = await res.json();
+        let html = '';
+        if(data.statement && data.statement.length > 0) {
+            data.statement.forEach(e => {
+                html += `<div class="p-2.5 bg-slate-900 rounded-xl border border-slate-900/60 text-[11px] mb-2">
+                    <span class="font-bold text-teal-300">${e.title}</span> - <span class="${e.statusColor}">${e.status}</span>
+                </div>`;
+            });
+        }
+        document.getElementById('passbookList').innerHTML = html || '<p class="text-center text-xs py-3">No history</p>';
+    }
+
+function replyHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>'); }
+    async function fetchStatus(silent = false) {
+        const res = await fetch('/api/app/check-status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: currentUser.telegramChatId }) });
+        const data = await res.json();
+        let html = '';
+        if(data.success && data.regularOrders) {
+            data.regularOrders.forEach(o => {
+                let badgeColor = 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+                if(o.status === 'Completed') badgeColor = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30';
+                if(o.status === 'Rejected' || o.status.includes('Cancelled')) badgeColor = 'bg-red-500/10 text-red-400 border-red-500/30';
+
+                html += `<div class="p-3 bg-slate-900 rounded-xl border border-teal-900/60 text-xs mb-2">
+                    <div class="flex justify-between items-center"><span>⚡ Reach: ${o.targetId}</span><span class="px-2 py-0.5 rounded-full border text-[9px] font-bold ${badgeColor}">${o.status}</span></div>
+                    ${o.adminReply ? `<div class="mt-2 pt-2 border-t border-teal-900/40 text-[10px] text-slate-300 leading-relaxed">${replyHtml(o.adminReply)}</div>` : ''}
+                </div>`;
+            });
+        }
+        document.getElementById('statusList').innerHTML = html || '<p class="text-center text-xs py-3">No active orders</p>';
+    }
+</script>
+<script>
+    // 🎁 offers: BUY uses the normal payment flow (the offer package is validated on the server)
+    window.OFFER_BUY = function (amount, coins) {
+        if (typeof currentUser === 'undefined' || !currentUser) return alert('Please login first!');
+        initiatePayment(amount, coins);
+    };
+</script>
+<script src="/offers.js"></script>
+</body>
+</html>

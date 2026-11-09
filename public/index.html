@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>
+/* Adds the login token to every /api/ call. If the server says the session expired, the saved login is cleared and the page reloads to the login screen. */
+(function () {
+  var _f = window.fetch;
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : ((input && input.url) || '');
+    var isApi = url.indexOf('/api/') === 0;
+    if (isApi) {
+      try {
+        var t = localStorage.getItem('jpw_token');
+        if (t) { init = Object.assign({}, init); init.headers = Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + t }); }
+      } catch (e) {}
+    }
+    return _f.call(this, input, init).then(function (r) {
+      try {
+        if (isApi && r.ok) sessionStorage.removeItem('jpw_reload');
+        if (isApi && r.status === 503 && r.headers.get('X-Maintenance')) { location.reload(); } // maintenance switched on: server now serves the maintenance page
+        if (isApi && r.status === 401 && !sessionStorage.getItem('jpw_reload')) {
+          ['jpw_token', 'jpw_chat_id', 'jpw_user_name', 'cid', 'cpass', 'chatid'].forEach(function (k) { localStorage.removeItem(k); });
+          sessionStorage.setItem('jpw_reload', '1');
+          location.reload();
+        }
+      } catch (e) {}
+      return r;
+    });
+  };
+})();
+</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JPW Engineer Portal - Premium Edition</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        :root { --bg:#0a1020; --card:#111a2c; --line:#1f2b44; --text:#e8eefc; --muted:#8fa0bf; --accent:#0d9488; }
+        * { box-sizing: border-box; }
+        body { font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--bg); margin: 0; padding: 14px; color: var(--text); min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; }
+        .container { width: 100%; max-width: 460px; background: var(--card); padding: 22px; border-radius: 20px; border: 1px solid var(--line); text-align: left; margin-top: 8px; }
+        .logo-box { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+        .logo-box img { width: 44px; height: 44px; border-radius: 12px; }
+        h2 { color: var(--text); margin: 0; font-size: 19px; font-weight: 800; }
+        input, button { width: 100%; padding: 13px 14px; margin: 6px 0; border: none; border-radius: 12px; font-size: 14px; box-sizing: border-box; font-family: inherit; }
+        input { background: #0b1324; color: #fff; border: 1px solid var(--line); outline: none; text-align: left; transition: border-color .2s, box-shadow .2s; }
+        input:focus { border-color: #14b8a6; box-shadow: 0 0 0 3px rgba(20,184,166,.22); }
+        input::placeholder { color: #5b6a88; }
+        button { background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; transition: background .15s, transform .1s; }
+        button:hover { background: #0f766e; }
+        button:active { transform: scale(.98); }
+        .top-header { display: flex; justify-content: space-between; align-items: center; background: #0b1324; padding: 12px 16px; border-radius: 14px; margin-bottom: 14px; border: 1px solid var(--line); font-size: 13px; }
+        .user-id { color: var(--muted); font-weight: 600; }
+        .coins-badge { background: #fbbf24; color: #0f172a; padding: 5px 12px; border-radius: 20px; font-weight: 800; font-size: 12px; }
+        .pkg-card { background: #0b1324; padding: 14px 16px; margin: 10px 0; border-radius: 14px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--line); text-align: left; font-size: 13px; }
+        .pkg-card button { width: auto; padding: 7px 16px; margin: 0; font-size: 12px; background: #059669; }
+        .pkg-card button:hover { background: #047857; }
+        .hidden { display: none !important; }
+        .user-box { background: #0b1324; padding: 16px; border-radius: 14px; text-align: left; border: 1px solid var(--line); margin-bottom: 14px; font-size: 13px; }
+        .action-row { display: flex; gap: 10px; margin-bottom: 14px; }
+        .btn-action { flex: 1; padding: 11px; border: 1px solid rgba(20,184,166,.45); border-radius: 12px; font-weight: 700; font-size: 13px; cursor: pointer; color: #5eead4; background: rgba(20,184,166,.10); transition: background .15s; }
+        .btn-action:hover { background: rgba(20,184,166,.22); }
+        .bottom-menu { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 16px; border-top: 1px solid var(--line); padding-top: 16px; }
+        .menu-item { background: #0b1324; padding: 12px 6px; border-radius: 12px; font-size: 12px; font-weight: 600; color: #cbd5e1; border: 1px solid var(--line); cursor: pointer; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 6px; transition: background .15s; text-align: center; }
+        .menu-item:hover { background: #14203a; color: #fff; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+
+    <div class="logo-box"><img src="https://cdn-icons-png.flaticon.com/512/3135/3135715.png" alt="Logo"><h2>JPW Engineer Portal</h2></div>
+
+    <!-- Web Login Screen -->
+    <div id="web-login-screen" class="hidden">
+        <h3 style="text-align: center; color: #e8eefc; margin-bottom: 6px; font-size: 16px;">Sign in with Telegram</h3>
+        <p style="font-size: 11px; color: #94a3b8; text-align: center; margin-bottom: 14px;">Connect with our bot to get your Chat ID:</p>
+        
+        <a id="launchBotBtn" href="https://t.me/JPWREACHSERVICESBOT" target="_blank" style="display: block; background: rgba(20, 184, 166, 0.15); border: 1px solid #14b8a6; color: #5eead4; text-align: center; padding: 13px; border-radius: 12px; font-weight: bold; text-decoration: none; margin-bottom: 14px; font-size: 13px;">🚀 LAUNCH TELEGRAM BOT</a>
+
+        <div style="border-top: 1px solid rgba(255,255,255,0.1); margin: 16px 0; padding-top: 16px;">
+            <p style="font-size: 11px; color: #94a3b8; text-align: center; margin-bottom: 8px;">Enter Chat ID to continue:</p>
+            <input type="text" id="webChatIdInput" placeholder="Chat ID">
+            <button onclick="requestOtp()">Get OTP</button>
+        </div>
+        <p id="loginMsg" style="color:#f43f5e; text-align:center; font-weight:bold; margin-top: 8px; font-size: 12px;"></p>
+        
+        <a href="https://wa.me/919382856020?text=Hello%20JPW%20Support,%20I%20need%20help%20with%20Engineer%20Portal." target="_blank" style="display: block; background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; color: #34d399; text-align: center; padding: 11px; border-radius: 12px; font-weight: bold; text-decoration: none; margin-top: 12px; font-size: 12px;">💬 WHATSAPP SUPPORT</a>
+    </div>
+
+    <!-- OTP Verification Screen -->
+    <div id="otp-verify-screen" class="hidden">
+        <h3 style="text-align: center; color: #e8eefc; margin-bottom: 6px; font-size: 16px;">Enter OTP</h3>
+        <p style="font-size: 11px; color: #94a3b8; text-align: center; margin-bottom: 16px;">6-digit code has been sent to your Telegram.</p>
+        <input type="text" id="otpInput" placeholder="------" maxlength="6" style="letter-spacing: 8px; text-align: center; font-weight: bold; font-size: 20px;">
+        <button onclick="verifyOtp()">Verify & log in</button>
+        <button onclick="backToChatId()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #cbd5e1; margin-top: 8px; box-shadow: none;">← Back</button>
+        <p id="otpMsg" style="color:#f43f5e; text-align:center; font-weight:bold; margin-top: 8px; font-size: 12px;"></p>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div id="dashboard-screen" class="hidden">
+        
+        <!-- Top Header Credentials -->
+        <div class="top-header">
+            <span class="user-id">ID: <span id="dispChatId" style="color:#2dd4bf;">------</span></span>
+            <span class="coins-badge"><span id="userCoins">0.00</span> COINS</span>
+        </div>
+
+        <div class="user-box">
+            <p style="margin: 4px 0; color: #94a3b8;">Engineer: <span id="userName" style="color: #e8eefc; font-weight: bold;"></span></p>
+            
+            <div style="display: flex; gap: 8px; margin-top: 12px;">
+                <button onclick="claimDailyBonus()" class="btn-action" style="margin:0; font-size: 11px; padding: 9px;">🎁 Daily bonus</button>
+                <button onclick="openTransferModal()" class="btn-action" style="margin:0; font-size: 11px; padding: 9px;">🤝 Share coins</button>
+                <button onclick="logout()" style="flex: 1; background: rgba(244, 63, 94, 0.15); border: 1px solid #f43f5e; color: #fb7185; margin:0; font-size: 11px; padding: 9px;">Log out</button>
+            </div>
+
+            
+        </div>
+
+        <!-- Coin Transfer Form Modal -->
+        <div id="transfer-box" class="hidden" style="background: rgba(15, 23, 42, 0.95); padding: 14px; border-radius: 12px; margin-bottom: 16px; border: 1px solid #14b8a6;">
+            <h4 style="margin: 0 0 8px 0; color: #ccfbf1; font-size: 13px;">🤝 Transfer coins</h4>
+            <input type="text" id="receiverChatId" placeholder="Receiver chat ID">
+            <input type="number" id="transferAmount" placeholder="Coin amount" step="any">
+            <button onclick="transferCoins()" style="margin-top: 4px; padding: 11px;">Send</button>
+            <button onclick="toggleTransferBox()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #cbd5e1; margin-top: 6px;">Cancel</button>
+        </div>
+
+        <!-- Switch Tabs (Regular Reach vs SR Service) -->
+        <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+            <button id="tabRegular" onclick="switchTab('regular')" style="flex: 1; padding: 11px; border-radius: 10px; font-size: 12px; font-weight: bold; cursor: pointer; background: #0d9488; color: #fff; border: none;">⚡ Regular reach</button>
+            <button id="tabSr" onclick="switchTab('sr')" style="flex: 1; padding: 11px; border-radius: 10px; font-size: 12px; font-weight: bold; cursor: pointer; background: rgba(255,255,255,0.05); color: #94a3b8; border: 1px solid rgba(255,255,255,0.1);">📌 SR SERVICE</button>
+        </div>
+
+        <!-- Regular Reach Order Form -->
+        <div id="formRegular">
+            <h3 style="color: #e8eefc; font-size: 14px; margin-bottom: 4px;">Place an order</h3>
+            <p style="font-size: 11px; color: #94a3b8; margin: 0 0 10px 0;">🕒 Hours: <span id="serviceHoursLabel">08:00 AM - 10:00 PM (IST)</span> | Cost: 1 Coin</p>
+            <input type="text" id="targetId" placeholder="Target ID">
+            <input type="password" id="targetPass" placeholder="Target password">
+            <button onclick="submitOrder()">Place order (1 coin)</button>
+            <p id="orderMsg" style="text-align:center; font-weight:bold; margin-top: 8px; font-size: 12px;"></p>
+        </div>
+
+        <!-- SR Service Form -->
+        <div id="formSr" class="hidden">
+            <div style="background: rgba(255, 255, 255, 0.02); border: 1px dashed rgba(20, 184, 166, 0.4); padding: 14px; border-radius: 12px;">
+                <h3 style="color: #e8eefc; font-size: 14px; margin-top: 0; margin-bottom: 4px;">CREATE SR SERVICE</h3>
+                <p style="font-size: 11px; color: #94a3b8; margin: 0 0 12px 0;">Cost: 1 Coin per submission</p>
+                
+                <input type="text" id="srCustomerName" placeholder="CUSTOMER NAME">
+                <input type="text" id="srMobile" placeholder="MOBILE NUMBER">
+                <input type="text" id="srLandline" placeholder="LANDLINE NUMBER">
+                
+                <button onclick="submitSrOrder()" style="margin-top: 8px;">SUBMIT SR ORDER</button>
+                <p id="srMsg" style="text-align:center; font-weight:bold; margin-top: 8px; font-size: 12px;"></p>
+            </div>
+        </div>
+
+        <!-- Add Coin & Help Action Row -->
+        <div class="action-row" style="margin-top: 16px;">
+            <button class="btn-action" onclick="openPackagesSection()">+ Add coins</button>
+        </div>
+
+        <!-- Bottom Quick Options Grid -->
+        <div class="bottom-menu">
+            <div class="menu-item" onclick="openPassbook()">📂 Passbook</div>
+            <div class="menu-item" onclick="openStatusTracker()">📊 Order Status</div>
+            <div class="menu-item" onclick="window.open('https://wa.me/919382856020', '_blank')">💬 Support</div>
+        </div>
+
+        <div id="offers-section"></div>
+        <h3 style="margin-top:22px; color: #e8eefc; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 8px; text-align: left;">Packages</h3>
+        <div id="packages-list"></div>
+    </div>
+
+    <!-- Footer -->
+    <div style="text-align: center; margin-top: 22px; font-size: 10px; color: #64748b; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 12px;">
+        <p>© 2026 JPW Reached Services. All rights reserved.</p>
+    </div>
+</div>
+
+<!-- Modal Popup for Passbook & Order Status -->
+<div id="infoModal" class="hidden" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(10px); display: flex; justify-content: center; align-items: center; z-index: 9999; padding: 20px;">
+    <div style="background: #111a2c; border: 1px solid rgba(20, 184, 166, 0.4); border-radius: 16px; width: 100%; max-width: 400px; padding: 22px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); max-height: 80vh; overflow-y: auto;">
+        <h3 id="modalTitle" style="color: #e8eefc; margin-top: 0; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 10px;">Details</h3>
+        <div id="modalBody" style="color: #cbd5e1; font-size: 12px; line-height: 1.6; margin: 15px 0; text-align: left;">Loading data...</div>
+        <button onclick="closeModal()" style="background: #0d9488; color: #fff; padding: 11px; font-weight: bold; border-radius: 10px; border: none; cursor: pointer; width: 100%;">Close</button>
+    </div>
+</div>
+
+<script>
+    let telegramChatId = localStorage.getItem('jpw_chat_id') || '';
+    let userName = localStorage.getItem('jpw_user_name') || 'Engineer';
+
+    // 🕒 Live IST Clock
+    function updateISTClock() {
+        const clockElem = document.getElementById('liveClock');
+        if (clockElem) {
+            const options = {
+                timeZone: 'Asia/Kolkata',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: true
+            };
+            clockElem.innerText = new Intl.DateTimeFormat('en-IN', options).format(new Date());
+        }
+    }
+    setInterval(updateISTClock, 1000);
+    updateISTClock();
+
+    // System Status Feed Animation
+    const feedTexts = [
+        "Secure gateway active & listening...",
+        "Bot connection healthy and synced.",
+        "Ready to execute target parameters.",
+        "All encryption protocols verified."
+    ];
+    let feedIndex = 0;
+    setInterval(() => {
+        const feedElem = document.getElementById('statusFeed');
+        if(feedElem) {
+            feedElem.innerText = feedTexts[feedIndex];
+            feedIndex = (feedIndex + 1) % feedTexts.length;
+        }
+    }, 4000);
+
+    window.addEventListener('DOMContentLoaded', async () => {
+        const tg = window.Telegram.WebApp;
+        if(tg && tg.expand) tg.expand();
+
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('payment') === 'success') {
+            const chatId = urlParams.get('telegramChatId');
+            const coins = urlParams.get('coins');
+            const orderId = urlParams.get('order_id');
+            if (chatId && coins) {
+                try {
+                    await fetch('/api/verify-instant', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ telegramChatId: chatId, coins, order_id: orderId })
+                    });
+                    alert(`🎉 Payment Successful! ${coins} JPW Coins added.`);
+                } catch(e) {}
+                window.location.href = '/';
+                return;
+            }
+        }
+
+        if (tg && tg.initData) {
+            // Inside Telegram: the server verifies Telegram's signed data (cannot be faked)
+            miniAppLogin(tg.initData);
+        } else if (telegramChatId && localStorage.getItem('jpw_token')) {
+            authenticateMiniApp(telegramChatId, userName);
+        } else {
+            document.getElementById('web-login-screen').classList.remove('hidden');
+        }
+    });
+
+    function switchTab(type) {
+        if(type === 'regular') {
+            document.getElementById('formRegular').classList.remove('hidden');
+            document.getElementById('formSr').classList.add('hidden');
+            document.getElementById('tabRegular').style.background = '#0d9488';
+            document.getElementById('tabRegular').style.color = '#fff';
+            document.getElementById('tabRegular').style.border = 'none';
+            document.getElementById('tabSr').style.background = 'rgba(255,255,255,0.05)';
+            document.getElementById('tabSr').style.color = '#94a3b8';
+            document.getElementById('tabSr').style.border = '1px solid rgba(255,255,255,0.1)';
+        } else {
+            document.getElementById('formRegular').classList.add('hidden');
+            document.getElementById('formSr').classList.remove('hidden');
+            document.getElementById('tabSr').style.background = '#0d9488';
+            document.getElementById('tabSr').style.color = '#fff';
+            document.getElementById('tabSr').style.border = 'none';
+            document.getElementById('tabRegular').style.background = 'rgba(255,255,255,0.05)';
+            document.getElementById('tabRegular').style.color = '#94a3b8';
+            document.getElementById('tabRegular').style.border = '1px solid rgba(255,255,255,0.1)';
+        }
+    }
+
+    let tempChatId = '';
+
+    (async function loadServiceHoursLabel() {
+        try {
+            const r = await fetch('/api/service-hours');
+            const d = await r.json();
+            const el = document.getElementById('serviceHoursLabel');
+            if (d && d.success && el) el.innerText = d.label;
+        } catch (e) {}
+    })();
+
+    async function requestOtp() {
+        tempChatId = document.getElementById('webChatIdInput').value.trim();
+        const msgTag = document.getElementById('loginMsg');
+        if(!tempChatId) {
+            msgTag.innerText = "Please enter your Telegram Chat ID!";
+            return;
+        }
+        msgTag.innerText = "Checking user & sending OTP...";
+
+        try {
+            const checkRes = await fetch('/api/auth/check-user-type', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ identifier: tempChatId })
+            });
+            const checkData = await checkRes.json();
+
+            if (!checkData.success) {
+                msgTag.innerText = checkData.message || "User not found!";
+                return;
+            }
+
+            if (checkData.authType === 'PASSWORD') {
+                msgTag.innerText = "This account uses ID + Password. Please login from the App page (/app).";
+                return;
+            }
+
+            tempChatId = checkData.telegramChatId;
+
+            const res = await fetch('/api/send-otp', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ telegramChatId: tempChatId })
+            });
+            
+            const data = await res.json();
+
+            if(data && data.success) {
+                document.getElementById('web-login-screen').classList.add('hidden');
+                document.getElementById('otp-verify-screen').classList.remove('hidden');
+                document.getElementById('otpMsg').innerText = "";
+            } else {
+                msgTag.innerText = (data && data.message) ? data.message : "Failed to send OTP!";
+            }
+        } catch(e) {
+            msgTag.innerText = "Network Error!";
+        }
+    }
+
+    async function verifyOtp() {
+        const otp = document.getElementById('otpInput').value.trim();
+        const msgTag = document.getElementById('otpMsg');
+        if(!otp || otp.length !== 6) {
+            msgTag.innerText = "Please enter a valid 6-digit OTP!";
+            return;
+        }
+        msgTag.innerText = "Verifying...";
+
+        try {
+            const res = await fetch('/api/verify-otp', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ telegramChatId: tempChatId, otp })
+            });
+            
+            const data = await res.json();
+
+            if(data && data.success) {
+                telegramChatId = data.user.telegramChatId;
+                userName = data.user.name;
+                if (data.token) localStorage.setItem('jpw_token', data.token);
+                
+                localStorage.setItem('jpw_chat_id', telegramChatId);
+                localStorage.setItem('jpw_user_name', userName);
+                
+                document.getElementById('otp-verify-screen').classList.add('hidden');
+                document.getElementById('dashboard-screen').classList.remove('hidden');
+                document.getElementById('userName').innerText = userName;
+                document.getElementById('dispChatId').innerText = telegramChatId;
+                document.getElementById('userCoins').innerText = data.user.jpwCoins.toFixed(2);
+                loadPackages();
+            } else {
+                msgTag.innerText = (data && data.message) ? data.message : "Incorrect OTP!";
+            }
+        } catch(e) {
+            msgTag.innerText = "Network Error!";
+        }
+    }
+
+    function backToChatId() {
+        document.getElementById('otp-verify-screen').classList.add('hidden');
+        document.getElementById('web-login-screen').classList.remove('hidden');
+    }
+
+    async function miniAppLogin(initData) {
+        try {
+            const res = await fetch('/api/mini-app/auth', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ initData }) });
+            const data = await res.json();
+            if (data.success && data.user && data.token) {
+                localStorage.setItem('jpw_token', data.token);
+                telegramChatId = data.user.telegramChatId;
+                userName = data.user.name || 'Engineer';
+                await authenticateMiniApp(telegramChatId, userName);
+            } else {
+                document.getElementById('web-login-screen').classList.remove('hidden');
+                if (data && data.message) document.getElementById('loginMsg').innerText = data.message;
+            }
+        } catch (e) {
+            document.getElementById('web-login-screen').classList.remove('hidden');
+        }
+    }
+
+    async function authenticateMiniApp(chatId, name) {
+        try {
+            const res = await fetch('/api/user/status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: String(chatId) }) });
+            const data = await res.json();
+            if(data.success && data.user) {
+                telegramChatId = data.user.telegramChatId;
+                userName = data.user.name || name;
+                
+                localStorage.setItem('jpw_chat_id', telegramChatId);
+                localStorage.setItem('jpw_user_name', userName);
+
+                document.getElementById('web-login-screen').classList.add('hidden');
+                document.getElementById('otp-verify-screen').classList.add('hidden');
+                document.getElementById('dashboard-screen').classList.remove('hidden');
+                document.getElementById('userName').innerText = userName;
+                document.getElementById('dispChatId').innerText = telegramChatId;
+                document.getElementById('userCoins').innerText = data.user.jpwCoins.toFixed(2);
+                loadPackages();
+            } else {
+                localStorage.removeItem('jpw_chat_id');
+                localStorage.removeItem('jpw_user_name');
+                localStorage.removeItem('jpw_token');
+                document.getElementById('web-login-screen').classList.remove('hidden');
+            }
+        } catch(e) {
+            if(telegramChatId) {
+                document.getElementById('web-login-screen').classList.add('hidden');
+                document.getElementById('dashboard-screen').classList.remove('hidden');
+                document.getElementById('userName').innerText = userName;
+                document.getElementById('dispChatId').innerText = telegramChatId;
+                loadPackages();
+            } else {
+                document.getElementById('web-login-screen').classList.remove('hidden');
+            }
+        }
+    }
+
+    function openTransferModal() {
+        document.getElementById('transfer-box').classList.toggle('hidden');
+    }
+
+    function toggleTransferBox() {
+        document.getElementById('transfer-box').classList.add('hidden');
+    }
+
+    async function transferCoins() {
+        const receiverChatId = document.getElementById('receiverChatId').value.trim();
+        const amount = document.getElementById('transferAmount').value.trim();
+        if(!receiverChatId || !amount) return alert('All fields are required');
+
+        try {
+            const res = await fetch('/api/transfer-coins', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ senderChatId: telegramChatId, receiverChatId, amount })
+            });
+            const data = await res.json();
+            if(data.success) {
+                alert(`✅ Successfully transferred ${amount} JPW Coins!`);
+                document.getElementById('userCoins').innerText = data.sender.jpwCoins.toFixed(2);
+                document.getElementById('receiverChatId').value = '';
+                document.getElementById('transferAmount').value = '';
+                toggleTransferBox();
+            } else {
+                alert(data.message || 'Transfer failed');
+            }
+        } catch(e) {
+            alert('Network Error!');
+        }
+    }
+
+    async function claimDailyBonus() {
+        try {
+            const res = await fetch('/api/claim-daily-bonus', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ telegramChatId })
+            });
+            const data = await res.json();
+            if(data.success) {
+                alert(`🎉 Daily Bonus Claimed! +${data.randomBonus} JPW Coins added.`);
+                document.getElementById('userCoins').innerText = data.user.jpwCoins.toFixed(2);
+            } else {
+                alert(data.message || 'Already claimed today!');
+            }
+        } catch(e) {
+            alert('Network Error!');
+        }
+    }
+
+    async function submitOrder() {
+        const targetId = document.getElementById('targetId').value.trim();
+        const targetPass = document.getElementById('targetPass').value.trim();
+        if(!targetId || !targetPass) return alert('All fields required');
+
+        const res = await fetch('/api/order', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ telegramChatId, targetId, targetPass })
+        });
+        const data = await res.json();
+        const msgTag = document.getElementById('orderMsg');
+        msgTag.innerText = data.message;
+        msgTag.style.color = data.success ? '#34d399' : '#f43f5e';
+        if(data.success) {
+            document.getElementById('targetId').value = '';
+            document.getElementById('targetPass').value = '';
+            authenticateMiniApp(telegramChatId, userName);
+        }
+    }
+
+    async function submitSrOrder() {
+        const customerName = document.getElementById('srCustomerName').value.trim();
+        const mobileNumber = document.getElementById('srMobile').value.trim();
+        const landlineNumber = document.getElementById('srLandline').value.trim();
+        if(!customerName || !mobileNumber || !landlineNumber) return alert('All fields are required!');
+
+        const res = await fetch('/api/sr-submit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ telegramChatId, customerName, mobileNumber, landlineNumber })
+        });
+        const data = await res.json();
+        const msgTag = document.getElementById('srMsg');
+        msgTag.innerText = data.message;
+        msgTag.style.color = data.success ? '#34d399' : '#f43f5e';
+        if(data.success) {
+            document.getElementById('srCustomerName').value = '';
+            document.getElementById('srMobile').value = '';
+            document.getElementById('srLandline').value = '';
+            authenticateMiniApp(telegramChatId, userName);
+        }
+    }
+
+    async function loadPackages() {
+        const res = await fetch('/api/packages');
+        const data = await res.json();
+        let html = '';
+        data.packages.forEach(p => {
+            const perCoin = (p.amount / p.coins).toFixed(2);
+            html += `<div class="pkg-card">
+                <div>
+                    <span style="color: #e8eefc; font-weight: 600;">₹${p.amount} ➡️ <b>${p.coins} JPW Coins</b></span>
+                    <div style="font-size: 11px; color: #94a3b8; margin-top: 3px;">(₹${perCoin} per coin)</div>
+                </div>
+                <button onclick="buyPkg(${p.amount}, ${p.coins})">PAY</button>
+            </div>`;
+        });
+        document.getElementById('packages-list').innerHTML = html;
+    }
+
+    function openPackagesSection() {
+        const pkgSection = document.getElementById('packages-list');
+        pkgSection.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // 💳 Updated buyPkg function to support Private Gateway redirect
+    async function buyPkg(amount, coins) {
+        const res = await fetch('/api/pay', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ telegramChatId, amount, coins })
+        });
+        const data = await res.json();
+        if(data.success && data.checkoutUrl) {
+            window.location.href = data.checkoutUrl;
+        } else {
+            alert('Error: ' + (data.message || 'Payment initialization failed'));
+        }
+    }
+
+    async function openPassbook() {
+        if(!telegramChatId) return alert('Please login first!');
+        document.getElementById('modalTitle').innerText = "📂 ACCOUNT PASSBOOK";
+        document.getElementById('modalBody').innerText = "Fetching ledger statements...";
+        document.getElementById('infoModal').classList.remove('hidden');
+
+        try {
+            const res = await fetch('/api/user/passbook', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ telegramChatId })
+            });
+            const data = await res.json();
+            
+            if(data.success && data.statement.length > 0) {
+                let html = '<div style="display: flex; flex-direction: column; gap: 10px;">';
+                data.statement.forEach(item => {
+                    html += `<div style="background: rgba(255,255,255,0.03); padding: 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.08);">
+                        <b style="color:#e8eefc;">${item.title}</b> (${item.type})<br>
+                        <span style="font-size: 11px; color: #94a3b8;">${item.description}</span><br>
+                        Status: <span style="color:${item.statusColor}; font-weight:bold;">${item.status}</span> | <span style="font-size:10px; color:#64748b;">${item.date}</span>
+                    </div>`;
+                });
+                html += '</div>';
+                document.getElementById('modalBody').innerHTML = html;
+            } else {
+                document.getElementById('modalBody').innerHTML = "No transaction history found.";
+            }
+        } catch(e) {
+            document.getElementById('modalBody').innerHTML = "Failed to load passbook data.";
+        }
+    }
+
+function replyHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>'); }
+    let statusTrackerTimer = null;
+    async function openStatusTracker() {
+        if (statusTrackerTimer) clearInterval(statusTrackerTimer);
+        statusTrackerTimer = setInterval(() => {
+            const m = document.getElementById('infoModal');
+            if (!m || m.classList.contains('hidden') || document.getElementById('modalTitle').innerText.indexOf('LIVE ORDER STATUS') < 0) { clearInterval(statusTrackerTimer); statusTrackerTimer = null; return; }
+            refreshStatusTracker();
+        }, 8000);
+        return refreshStatusTracker(true);
+    }
+    async function refreshStatusTracker(first) {
+        if(!telegramChatId) return alert('Please login first!');
+        document.getElementById('modalTitle').innerText = "📊 LIVE ORDER STATUS";
+        if (first) { document.getElementById('modalBody').innerText = "Fetching active orders..."; }
+        document.getElementById('infoModal').classList.remove('hidden');
+
+        try {
+            const res = await fetch('/api/app/check-status', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ telegramChatId })
+            });
+            const data = await res.json();
+            
+            if(data.success) {
+                let html = '';
+                if(data.regularOrders && data.regularOrders.length > 0) {
+                    html += '<b style="color:#5eead4;">Regular Reach Orders:</b><br><br>';
+                    data.regularOrders.slice(0, 5).forEach(o => {
+                        html += `<div style="margin-bottom:10px; font-size:12px;">• ID: <code>${o.targetId}</code> ➔ <b>${o.status}</b>${o.adminReply ? `<div style="margin-top:4px; font-size:11px; color:#cbd5e1; line-height:1.4;">${replyHtml(o.adminReply)}</div>` : ''}</div>`;
+                    });
+                } else {
+                    html += 'No recent regular orders.';
+                }
+                document.getElementById('modalBody').innerHTML = html;
+            } else {
+                document.getElementById('modalBody').innerHTML = "No status data found.";
+            }
+        } catch(e) {
+            document.getElementById('modalBody').innerHTML = "Failed to fetch order status.";
+        }
+    }
+
+    function closeModal() {
+        document.getElementById('infoModal').classList.add('hidden');
+    }
+
+    function logout() {
+        localStorage.removeItem('jpw_token');
+        localStorage.removeItem('jpw_chat_id');
+        localStorage.removeItem('jpw_user_name');
+        location.reload();
+    }
+</script>
+
+<script>
+    // 🎁 offers: BUY uses the normal payment flow (the offer package is validated on the server)
+    window.OFFER_BUY = function (amount, coins) {
+        if (typeof telegramChatId === 'undefined' || !telegramChatId) return alert('Please login first!');
+        buyPkg(amount, coins);
+    };
+</script>
+<script src="/offers.js"></script>
+</body>
+</html>

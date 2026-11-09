@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script>
+/* Adds the login token to every /api/ call. If the server says the session expired, the saved login is cleared and the page reloads to the login screen. */
+(function () {
+  var _f = window.fetch;
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : ((input && input.url) || '');
+    var isApi = url.indexOf('/api/') === 0;
+    if (isApi) {
+      try {
+        var t = localStorage.getItem('jpw_token');
+        if (t) { init = Object.assign({}, init); init.headers = Object.assign({}, init.headers, { 'Authorization': 'Bearer ' + t }); }
+      } catch (e) {}
+    }
+    return _f.call(this, input, init).then(function (r) {
+      try {
+        if (isApi && r.ok) sessionStorage.removeItem('jpw_reload');
+        if (isApi && r.status === 503 && r.headers.get('X-Maintenance')) { location.reload(); } // maintenance switched on: server now serves the maintenance page
+        if (isApi && r.status === 401 && !sessionStorage.getItem('jpw_reload')) {
+          ['jpw_token', 'jpw_chat_id', 'jpw_user_name', 'cid', 'cpass', 'chatid'].forEach(function (k) { localStorage.removeItem(k); });
+          sessionStorage.setItem('jpw_reload', '1');
+          location.reload();
+        }
+      } catch (e) {}
+      return r;
+    });
+  };
+})();
+</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JPW Reseller Hub - Bulk Management</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        :root { --bg:#0a1020; --card:#111a2c; --line:#1f2b44; --text:#e8eefc; --muted:#8fa0bf; --accent:#14b8a6; }
+        body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+        .card { background: var(--card); border: 1px solid var(--line); }
+        input, textarea, select { background: #0b1324; border: 1px solid var(--line); color: var(--text); }
+        input::placeholder { color: #5b6a88; }
+        input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(20,184,166,.22); }
+        .mono { font-family: inherit; }
+        .hidden { display: none !important; }
+        ::-webkit-scrollbar { height:6px; width:6px; } ::-webkit-scrollbar-thumb { background:#1f2b44; border-radius:8px; }
+    </style>
+</head>
+<body class="p-4 flex items-center justify-center min-h-screen">
+<div class="w-full max-w-lg glass p-6 rounded-2xl relative">
+    <div class="text-center mb-5">
+        <h1 class="text-xl font-black text-teal-400 mono">JPW RESELLER HUB</h1>
+        <p class="text-xs text-slate-400">Wholesale Bulk Portal</p>
+    </div>
+
+    <!-- Login section -->
+    <div id="loginSection" class="space-y-3">
+        <input type="text" id="resellerIdInput" placeholder="Enter ID or Telegram Chat ID" class="w-full p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white">
+        <button onclick="checkResellerIdentifier()" class="w-full py-3.5 bg-teal-600 text-white font-bold rounded-xl text-xs">LOGIN ➔</button>
+        <div id="stepOtp" class="hidden space-y-2 mt-2">
+            <input type="text" id="resellerOtp" placeholder="Enter 6-digit OTP" maxlength="6" class="w-full p-3 rounded-xl bg-slate-950 text-center text-lg font-bold">
+            <button onclick="loginWithOtp()" class="w-full py-3 bg-emerald-600 text-white font-bold rounded-xl text-xs">VERIFY</button>
+        </div>
+        <p id="authMsg" class="text-center text-xs text-rose-400"></p>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="dashboardSection" class="hidden space-y-4">
+        <div class="p-4 rounded-xl bg-slate-950 border border-teal-500/30 flex justify-between items-center">
+            <div>
+                <h3 id="resellerName" class="font-bold text-sm text-teal-300">Partner</h3>
+                <p id="resellerChatId" class="text-[10px] text-slate-500 mono"></p>
+            </div>
+            <div class="text-right">
+                <p class="text-[10px] text-slate-400">Balance</p>
+                <h2 class="text-lg font-black text-amber-400"><span id="resellerCoins">0</span> Coins</h2>
+            </div>
+        </div>
+
+        <div class="p-4 rounded-xl bg-slate-900 space-y-2">
+            <h4 class="text-xs font-bold text-teal-400 ">⚡ Instant Bulk Reach</h4>
+            <input type="text" id="targetId" placeholder="Target ID" class="w-full p-2.5 rounded-lg bg-slate-950 text-xs text-white">
+            <input type="password" id="targetPass" placeholder="Target Password" class="w-full p-2.5 rounded-lg bg-slate-950 text-xs text-white">
+            <button onclick="submitResellerOrder()" class="w-full py-2.5 bg-teal-600 text-white font-bold rounded-xl text-xs">SUBMIT REACH</button>
+            <p id="orderStatusMsg" class="text-center text-xs font-bold"></p>
+        </div>
+
+        <!-- 📊 Bulk Status Tracker Sections -->
+        <div class="space-y-3">
+            <div class="flex justify-between items-center">
+                <h4 class="text-xs font-bold text-slate-300 ">📦 Bulk Order Tracker</h4>
+                <button onclick="loadResellerOrders()" class="text-[10px] text-teal-400 underline">🔄 Refresh Status</button>
+            </div>
+
+            <!-- Tab Buttons for Sections -->
+            <div class="grid grid-cols-3 gap-1.5 bg-slate-950 p-1 rounded-xl">
+                <button onclick="switchTrackerTab('completed')" id="btnComp" class="py-1.5 text-[10px] font-bold bg-emerald-600 text-white rounded-lg">Completed (<span id="countComp">0</span>)</button>
+                <button onclick="switchTrackerTab('inprogress')" id="btnProg" class="py-1.5 text-[10px] font-bold text-slate-400 rounded-lg">In Progress (<span id="countProg">0</span>)</button>
+                <button onclick="switchTrackerTab('failed')" id="btnFail" class="py-1.5 text-[10px] font-bold text-slate-400 rounded-lg">Failed (<span id="countFail">0</span>)</button>
+            </div>
+
+            <!-- Tracker List Box -->
+            <div id="trackerListContainer" class="max-h-48 overflow-y-auto space-y-2 pr-1">
+                <!-- Dynamic Items -->
+            </div>
+        </div>
+
+        <div id="plansList" class="space-y-2"></div>
+        <div class="text-center"><a href="/" class="text-xs text-teal-400 underline">⬅️ Retail Portal</a></div>
+    </div>
+</div>
+
+<!-- Modal -->
+<div id="paymentModal" class="fixed inset-0 bg-slate-900/80 flex items-center justify-center p-4 hidden z-50">
+    <div class="bg-slate-900 border border-teal-500 p-6 rounded-2xl max-w-xs w-full text-center space-y-3 relative">
+        <button onclick="closePaymentModal()" class="absolute top-3 right-3 text-white font-bold">✕</button>
+        <h3 class="text-sm font-bold text-white"><span id="modalCoins">0</span> Coins (₹<span id="modalAmount">0</span>)</h3>
+        <div class="bg-white p-2 rounded-xl inline-block"><img id="upiQrImage" class="w-40 h-40"></div>
+        <a id="waDirectBtn" href="#" target="_blank" class="block w-full py-3 bg-emerald-600 text-white font-bold rounded-xl text-xs">💬 VERIFY ON WHATSAPP</a>
+    </div>
+</div>
+
+<script>
+    let activeChatId = localStorage.getItem('jpw_chat_id') || '';
+    let identifiedUser = null;
+    let currentOrdersData = { completed: [], inProgress: [], failed: [] };
+    let activeTab = 'completed';
+    const ADMIN_WA = '919382856020';
+    const ADMIN_UPI = 'Paytm.s2ujlw0@pty';
+
+    if(activeChatId) loadDash(activeChatId);
+
+    async function checkResellerIdentifier() {
+        const identifier = document.getElementById('resellerIdInput').value.trim();
+        const res = await fetch('/api/auth/check-user-type', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ identifier }) });
+        const data = await res.json();
+        if(data.success) {
+            if(data.authType === 'PASSWORD') {
+                document.getElementById('authMsg').innerText = 'This account uses ID + Password. Please login from the App page (/app).';
+                return;
+            }
+            identifiedUser = data;
+            // The OTP was never being requested here - send it before showing the OTP box
+            const otpRes = await fetch('/api/send-otp', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: data.telegramChatId }) });
+            const otpData = await otpRes.json();
+            if(otpData.success) {
+                document.getElementById('authMsg').innerText = '';
+                document.getElementById('stepOtp').classList.remove('hidden');
+            } else { document.getElementById('authMsg').innerText = otpData.message || 'Failed to send OTP'; }
+        } else { document.getElementById('authMsg').innerText = data.message; }
+    }
+
+    async function loginWithOtp() {
+        const otp = document.getElementById('resellerOtp').value.trim();
+        const res = await fetch('/api/verify-otp', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: identifiedUser.telegramChatId, otp }) });
+        const data = await res.json();
+        if(data.success) {
+            activeChatId = data.user.telegramChatId;
+            if (data.token) localStorage.setItem('jpw_token', data.token);
+            localStorage.setItem('jpw_chat_id', activeChatId);
+            loadDash(activeChatId);
+        } else { document.getElementById('authMsg').innerText = data.message || 'Invalid OTP'; }
+    }
+
+    async function loadDash(chatId) {
+        document.getElementById('loginSection').classList.add('hidden');
+        document.getElementById('dashboardSection').classList.remove('hidden');
+        const res = await fetch('/api/mini-app/auth', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: chatId }) });
+        const data = await res.json();
+        if(data.success) {
+            document.getElementById('resellerName').innerText = data.user.name;
+            document.getElementById('resellerChatId').innerText = `ID: ${data.user.telegramChatId}`;
+            document.getElementById('resellerCoins').innerText = data.user.jpwCoins.toFixed(2);
+            renderPlans(data.user.trial10Count || 0);
+            loadResellerOrders();
+        }
+    }
+
+    setInterval(() => { if (typeof activeChatId !== 'undefined' && activeChatId && !document.hidden) loadResellerOrders().catch(()=>{}); }, 10000);
+    async function loadResellerOrders() {
+        const res = await fetch('/api/reseller/orders-status', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: activeChatId }) });
+        const data = await res.json();
+        if(data.success) {
+            currentOrdersData.completed = data.completed;
+            currentOrdersData.inProgress = data.inProgress;
+            currentOrdersData.failed = data.failed;
+
+            document.getElementById('countComp').innerText = data.completed.length;
+            document.getElementById('countProg').innerText = data.inProgress.length;
+            document.getElementById('countFail').innerText = data.failed.length;
+
+            renderTrackerTab();
+        }
+    }
+
+    function switchTrackerTab(tab) {
+        activeTab = tab;
+        document.getElementById('btnComp').className = tab === 'completed' ? 'py-1.5 text-[10px] font-bold bg-emerald-600 text-white rounded-lg' : 'py-1.5 text-[10px] font-bold text-slate-400 rounded-lg';
+        document.getElementById('btnProg').className = tab === 'inprogress' ? 'py-1.5 text-[10px] font-bold bg-amber-600 text-white rounded-lg' : 'py-1.5 text-[10px] font-bold text-slate-400 rounded-lg';
+        document.getElementById('btnFail').className = tab === 'failed' ? 'py-1.5 text-[10px] font-bold bg-rose-600 text-white rounded-lg' : 'py-1.5 text-[10px] font-bold text-slate-400 rounded-lg';
+        renderTrackerTab();
+    }
+
+function replyHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>'); }
+    function renderTrackerTab() {
+        const list = currentOrdersData[activeTab === 'completed' ? 'completed' : activeTab === 'inprogress' ? 'inProgress' : 'failed'];
+        let html = '';
+        if(list.length === 0) {
+            html = `<p class="text-center text-[10px] text-slate-500 py-3">No orders found in this section.</p>`;
+        } else {
+            list.forEach(o => {
+                html += `<div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs flex justify-between items-center">
+                    <div><span class="font-bold text-teal-300">🎯 ${o.targetId}</span><p class="text-[9px] text-slate-400">${new Date(o.createdAt).toLocaleTimeString()}</p>${o.adminReply ? `<p class="text-[9px] text-slate-300 mt-1 leading-snug">${replyHtml(o.adminReply)}</p>` : ''}</div>
+                    <span class="px-2 py-0.5 rounded text-[9px] font-bold ${activeTab==='completed'?'bg-emerald-500/10 text-emerald-400':activeTab==='inprogress'?'bg-amber-500/10 text-amber-400':'bg-rose-500/10 text-rose-400'}">${o.status}</span>
+                </div>`;
+            });
+        }
+        document.getElementById('trackerListContainer').innerHTML = html;
+    }
+
+    function renderPlans(trialCount) {
+        let html = '';
+        if(trialCount < 5) html += `<div class="p-3 bg-slate-950 rounded-xl flex justify-between items-center text-xs"><span>1 Coin Trial</span><button onclick="openModal(1, 10)" class="px-3 py-1 bg-teal-600 text-white rounded">BUY</button></div>`;
+        html += `<div class="p-3 bg-slate-950 rounded-xl flex justify-between items-center text-xs"><span>10 Coins</span><button onclick="openModal(10, 95)" class="px-3 py-1 bg-teal-600 text-white rounded">BUY</button></div>`;
+        html += `<div class="p-3 bg-slate-950 rounded-xl flex justify-between items-center text-xs"><span>50 Coins</span><button onclick="openModal(50, 425)" class="px-3 py-1 bg-teal-600 text-white rounded">BUY</button></div>`;
+        html += `<div class="p-3 bg-slate-950 rounded-xl flex justify-between items-center text-xs"><span>150 Coins</span><button onclick="openModal(150, 1050)" class="px-3 py-1 bg-amber-500 text-black font-bold rounded">BUY VIP</button></div>`;
+        document.getElementById('plansList').innerHTML = html;
+    }
+
+    function openModal(coins, amount) {
+        document.getElementById('modalCoins').innerText = coins;
+        document.getElementById('modalAmount').innerText = amount;
+        const upiString = `upi://pay?pa=${ADMIN_UPI}&pn=JPW%20Reseller%20Hub&am=${amount}&cu=INR`;
+        document.getElementById('upiQrImage').src = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(upiString)}`;
+        document.getElementById('waDirectBtn').href = `https://wa.me/${ADMIN_WA}?text=${encodeURIComponent(`Reseller Payment: ${coins} Coins for ₹${amount} (ID: ${activeChatId})`)}`;
+        document.getElementById('paymentModal').classList.remove('hidden');
+    }
+
+    function closePaymentModal() { document.getElementById('paymentModal').classList.add('hidden'); }
+
+    async function submitResellerOrder() {
+        const targetId = document.getElementById('targetId').value.trim();
+        const targetPass = document.getElementById('targetPass').value.trim();
+        if(!targetId || !targetPass) return alert('Fill all fields');
+
+        const res = await fetch('/api/order', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ telegramChatId: activeChatId, targetId, targetPass, isPriority: true }) });
+        const data = await res.json();
+        document.getElementById('orderStatusMsg').innerText = data.message;
+        if(data.success) {
+            document.getElementById('targetId').value = '';
+            document.getElementById('targetPass').value = '';
+            loadDash(activeChatId);
+        }
+    }
+</script>
+</body>
+</html>

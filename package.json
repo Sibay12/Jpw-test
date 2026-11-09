@@ -1,0 +1,26 @@
+{
+  "name": "jpw-root-bot",
+  "version": "2.9.2",
+  "description": "JPW Public Reach and Automation Bot System - Interactive Button Transfer & UX Edition",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "bot": "node bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.1",
+    "node-fetch": "^2.7.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "pino": "^8.21.0",
+    "qrcode": "^1.5.4",
+    "telegram": "^2.19.13"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
