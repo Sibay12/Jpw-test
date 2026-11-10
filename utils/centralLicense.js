@@ -3,12 +3,17 @@
 const crypto = require('crypto');
 const { encryptSensitive, decryptSensitive } = require('./fieldEncryption');
 
-// Fixed product endpoint/configuration. These are identifiers, not secrets.
-// Keep this file server-side; do not expose it through static/public assets.
-const API_BASE = 'http://license.takna.online/api/v1';
+// Central endpoint can be overridden per deployment. HTTPS is the secure default.
+// HTTP is accepted only when explicitly configured; it exposes license traffic to interception.
+// Keep this module server-side; never expose it through static/public assets.
+const DEFAULT_API_BASE = 'https://license.takna.online/api/v1';
+const API_BASE = String(process.env.LICENSE_API_BASE || DEFAULT_API_BASE).trim().replace(/\/+$/, '');
 const PRODUCT_CODE = 'JPW';
 const VERIFY_INTERVAL_MS = Math.max(60_000, Number(process.env.LICENSE_VERIFY_INTERVAL_MS || 6 * 60 * 60 * 1000));
 const REQUEST_TIMEOUT_MS = 15_000;
+if (API_BASE.startsWith('http://')) {
+  console.warn('[LICENSE SECURITY WARNING] LICENSE_API_BASE is using plain HTTP. License keys and verification data are not encrypted in transit. Use HTTPS for production.');
+}
 
 function normalizeDomain(value) {
   return String(value || '').trim().toLowerCase().replace(/:\d+$/, '').replace(/^www\./, '').replace(/\.$/, '');
@@ -19,7 +24,9 @@ function getDomain(req) {
 }
 function assertConfig() {
   const u = new URL(API_BASE);
-  if (u.protocol !== 'http:') throw new Error('Central license API must use HTTP.');
+  if (!['https:', 'http:'].includes(u.protocol)) throw new Error('Central license API URL must use HTTP or HTTPS.');
+  if (u.username || u.password) throw new Error('Central license API URL must not contain embedded credentials.');
+  if (!u.pathname.endsWith('/api/v1')) throw new Error('Central license API URL must end with /api/v1.');
   if (!/^[A-Z0-9_-]{2,40}$/.test(PRODUCT_CODE)) throw new Error('Built-in license product code is invalid.');
 }
 async function callCentral(path, payload) {
@@ -45,7 +52,7 @@ async function callCentral(path, payload) {
       const cause = causeCode ? ` (${causeCode})` : '';
       const detail = controller.signal.aborted
         ? `Central license server timed out after ${REQUEST_TIMEOUT_MS} ms.`
-        : `Cannot connect to Central License Server at ${new URL(API_BASE).host}${cause}. Check Render outbound network, DNS and the portal's HTTP certificate.`;
+        : `Cannot connect to Central License Server at ${new URL(API_BASE).host}${cause}. Check Render outbound network, DNS and the portal's ${new URL(API_BASE).protocol.toUpperCase()} configuration/certificate.`;
       const err = new Error(detail);
       err.code = causeCode || (controller.signal.aborted ? 'ETIMEDOUT' : 'ECONNECT');
       err.cause = networkError;
@@ -58,7 +65,7 @@ async function callCentral(path, payload) {
       throw new Error(`Central License Server returned non-JSON response (HTTP ${response.status}). Check PHP endpoint and hosting rewrite configuration.`);
     }
     if (!response.ok || data.success !== true || data.active !== true || data.status !== 'ACTIVE') {
-      const message = String(data.message || `Central license server rejected the request (HTTPS ${response.status}).`).slice(0, 300);
+      const message = String(data.message || `Central license server rejected the request (HTTP ${response.status}).`).slice(0, 300);
       const err = new Error(message); err.statusCode = response.status; err.centralStatus = data.status || 'UNVERIFIED'; throw err;
     }
     // The deployed central v1 API returns license.features; an empty list is

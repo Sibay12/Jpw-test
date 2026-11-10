@@ -2,7 +2,8 @@
 
 ## Central authority
 - Portal: https://license.takna.online/
-- API base: `https://license.takna.online/api/v1`
+- Default API base: `https://license.takna.online/api/v1`
+- Optional Render override: `LICENSE_API_BASE` (must end in `/api/v1`; accepts `https://` or `http://`; HTTPS is strongly recommended).
 - Product code: `JPW`
 - Product endpoints used by this application:
   - `POST /licenses/activate`
@@ -21,10 +22,11 @@ This integration uses only the central portal's Activate and Verify contracts. T
 
 ## JPW server configuration
 Set these Render environment variables:
-- Central API URL and product code (`JPW`) are fixed in the private backend module `utils/centralLicense.js`; no Environment Variables are needed for these values.
+- Product code (`JPW`) is fixed in the private backend module. The API URL defaults to `https://license.takna.online/api/v1`; optionally set `LICENSE_API_BASE` in Render to another HTTP or HTTPS API base ending in `/api/v1`.
 - `LICENSE_DOMAIN=the-exact-customer-domain.example` (no scheme, no path; must match the incoming host)
 - `LICENSE_VERIFY_INTERVAL_MS=21600000` (6 hours; minimum 60 seconds)
 - Central API request timeout is fixed at 15 seconds in the backend module.
+- `LICENSE_API_BASE` accepts both HTTP and HTTPS. HTTPS is required for production security. Plain HTTP sends license keys and verification payloads without encryption and is vulnerable to interception or modification; use it only for a temporary controlled diagnostic, never as a production workaround.
 - `DATA_ENCRYPTION_KEY` must be a stable 32-byte key (64 hexadecimal characters) because the stored license key is encrypted at rest using the existing field encryption utility.
 - `SERVER_PUBLIC_URL` should also be the correct HTTPS public URL for the installation.
 
@@ -34,7 +36,7 @@ Do not put a central portal database password or `marketplace_api_secret` in the
 1. Customer extracts and deploys the JPW package.
 2. Customer opens the site; the app displays `/license` until a valid license is activated.
 3. Customer enters the license key.
-4. JPW backend calls the central Activate endpoint over HTTPS with `product`, `licenseKey`, `installationId`, `domain`, and optional `owner`.
+4. JPW backend calls the central Activate endpoint using the configured `LICENSE_API_BASE` (HTTPS by default) with `product`, `licenseKey`, `installationId`, `domain`, and optional `owner`.
 5. Central portal validates product, license status, expiry, domain and activation limit.
 6. JPW stores the license key encrypted in MongoDB and the persistent installation ID in its own database.
 7. The application starts its background workers and bot integrations only after successful activation.
