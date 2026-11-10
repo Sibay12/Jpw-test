@@ -21,11 +21,10 @@ This integration uses only the central portal's Activate and Verify contracts. T
 
 ## JPW server configuration
 Set these Render environment variables:
-- `LICENSE_API_BASE=https://license.takna.online/api/v1`
-- `LICENSE_PRODUCT_CODE=JPW`
+- Central API URL and product code (`JPW`) are fixed in the private backend module `utils/centralLicense.js`; no Environment Variables are needed for these values.
 - `LICENSE_DOMAIN=the-exact-customer-domain.example` (no scheme, no path; must match the incoming host)
 - `LICENSE_VERIFY_INTERVAL_MS=21600000` (6 hours; minimum 60 seconds)
-- `LICENSE_REQUEST_TIMEOUT_MS=10000`
+- Central API request timeout is fixed at 15 seconds in the backend module.
 - `DATA_ENCRYPTION_KEY` must be a stable 32-byte key (64 hexadecimal characters) because the stored license key is encrypted at rest using the existing field encryption utility.
 - `SERVER_PUBLIC_URL` should also be the correct HTTPS public URL for the installation.
 
@@ -67,3 +66,16 @@ The supplied portal's API response schemas match the Activate/Verify client used
 - Verify expects `product`, `licenseKey`, `installationId`, and `domain`, and returns the same active license envelope.
 
 The portal's `products` table is not pre-populated by `schema.sql`; register `JPW` in the portal UI. The supplied guide correctly warns that endpoint availability alone is not proof of product registration or operational status.
+
+
+## Fetch failed / Central connection troubleshooting
+
+The JPW backend calls the central API server-to-server. Render Environment must contain:
+
+```env
+The API URL (`https://license.takna.online/api/v1`), product code (`JPW`) and 15-second request timeout are hardcoded in `utils/centralLicense.js`. Do not add these as Render Environment Variables.
+```
+
+The central API URL and product code are fixed in the backend module. The JPW server reports DNS (`ENOTFOUND`), TLS/certificate, connection reset and timeout failures more specifically. Never disable TLS certificate verification.
+
+If the error names DNS/TLS/connectivity, check that `https://license.takna.online/api/v1/status` is reachable over HTTPS from the public internet and that the domain certificate is valid. The central API activation URL must be `https://license.takna.online/api/v1/licenses/activate`. If it returns a non-JSON page/404, check the PHP host's nested `index.php` routing and HTTPS configuration.

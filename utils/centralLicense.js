@@ -3,11 +3,12 @@
 const crypto = require('crypto');
 const { encryptSensitive, decryptSensitive } = require('./fieldEncryption');
 
-const DEFAULT_API_BASE = 'https://license.takna.online/api/v1';
-const PRODUCT_CODE = String(process.env.LICENSE_PRODUCT_CODE || 'JPW').trim().toUpperCase();
-const API_BASE = String(process.env.LICENSE_API_BASE || DEFAULT_API_BASE).replace(/\/+$/, '');
+// Fixed product endpoint/configuration. These are identifiers, not secrets.
+// Keep this file server-side; do not expose it through static/public assets.
+const API_BASE = 'https://license.takna.online/api/v1';
+const PRODUCT_CODE = 'JPW';
 const VERIFY_INTERVAL_MS = Math.max(60_000, Number(process.env.LICENSE_VERIFY_INTERVAL_MS || 6 * 60 * 60 * 1000));
-const REQUEST_TIMEOUT_MS = Math.max(3_000, Math.min(30_000, Number(process.env.LICENSE_REQUEST_TIMEOUT_MS || 10_000)));
+const REQUEST_TIMEOUT_MS = 15_000;
 
 function normalizeDomain(value) {
   return String(value || '').trim().toLowerCase().replace(/:\d+$/, '').replace(/^www\./, '').replace(/\.$/, '');
@@ -18,27 +19,53 @@ function getDomain(req) {
 }
 function assertConfig() {
   const u = new URL(API_BASE);
-  if (u.protocol !== 'https:') throw new Error('LICENSE_API_BASE must use HTTPS.');
-  if (!/^[A-Z0-9_-]{2,40}$/.test(PRODUCT_CODE)) throw new Error('LICENSE_PRODUCT_CODE is invalid.');
+  if (u.protocol !== 'https:') throw new Error('Central license API must use HTTPS.');
+  if (!/^[A-Z0-9_-]{2,40}$/.test(PRODUCT_CODE)) throw new Error('Built-in license product code is invalid.');
 }
 async function callCentral(path, payload) {
   assertConfig();
+  if (!path.startsWith('/licenses/')) throw new Error('Invalid central license API path.');
+  const url = `${API_BASE}${path}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
+  let raw = '';
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    const data = await response.json().catch(() => null);
-    if (!data || typeof data !== 'object') throw new Error('Central license server returned an invalid response.');
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+        redirect: 'error'
+      });
+    } catch (networkError) {
+      const rootCause = networkError && (networkError.cause || networkError);
+      const causeCode = rootCause && rootCause.code ? rootCause.code : (networkError && networkError.code);
+      const cause = causeCode ? ` (${causeCode})` : '';
+      const detail = controller.signal.aborted
+        ? `Central license server timed out after ${REQUEST_TIMEOUT_MS} ms.`
+        : `Cannot connect to Central License Server at ${new URL(API_BASE).host}${cause}. Check Render outbound network, DNS and the portal's HTTPS certificate.`;
+      const err = new Error(detail);
+      err.code = causeCode || (controller.signal.aborted ? 'ETIMEDOUT' : 'ECONNECT');
+      err.cause = networkError;
+      throw err;
+    }
+    raw = await response.text();
+    let data;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) { data = null; }
+    if (!data || typeof data !== 'object') {
+      throw new Error(`Central License Server returned non-JSON response (HTTP ${response.status}). Check PHP endpoint and hosting rewrite configuration.`);
+    }
     if (!response.ok || data.success !== true || data.active !== true || data.status !== 'ACTIVE') {
-      const message = String(data.message || `Central license server rejected the request (${response.status}).`).slice(0, 300);
+      const message = String(data.message || `Central license server rejected the request (HTTP ${response.status}).`).slice(0, 300);
       const err = new Error(message); err.statusCode = response.status; err.centralStatus = data.status || 'UNVERIFIED'; throw err;
     }
-    if (!data.license || !Array.isArray(data.license.features)) throw new Error('Central license response is missing required license entitlements.');
+    // The deployed central v1 API returns license.features; an empty list is
+    // valid for a product/license with no feature rows configured yet.
+    if (!data.license || !Array.isArray(data.license.features)) {
+      throw new Error('Central license response is missing license.features. Confirm the deployed portal API version.');
+    }
     return data;
   } finally {
     clearTimeout(timer);

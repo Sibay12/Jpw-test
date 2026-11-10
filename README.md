@@ -30,4 +30,4 @@ npm start
 For the full instructions, see `FRESH_SETUP_GUIDE_EN.md`.
 
 ## Central license activation
-This package is protected by the TAKNA Central License Portal. Configure `LICENSE_API_BASE`, `LICENSE_PRODUCT_CODE=JPW`, `LICENSE_DOMAIN`, and a stable `DATA_ENCRYPTION_KEY` in Render. Register product `JPW` as ACTIVE in the central portal's Product & Feature Registry, create a license, deploy JPW, then open `/license` and enter the license key. See `LICENSE-INTEGRATION.md` for the exact setup and test procedure. The application remains locked if central verification fails.
+This package is protected by the TAKNA Central License Portal. The Central API URL and product code `JPW` are built into the backend. Configure `LICENSE_DOMAIN` if required and a stable `DATA_ENCRYPTION_KEY` in Render. Register product `JPW` as ACTIVE in the central portal's Product & Feature Registry, create a license, deploy JPW, then open `/license` and enter the license key. See `LICENSE-INTEGRATION.md` for the exact setup and test procedure. The application remains locked if central verification fails.
