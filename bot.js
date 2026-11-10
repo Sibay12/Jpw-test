@@ -77,7 +77,6 @@ setInterval(async () => {
 }, 60 * 60 * 1000);
 
 bot.on('message', async (msg) => {
-    if (global.__JPW_LICENSE_ACTIVE !== true) return;
     if (!msg || !msg.chat || !msg.text) return;
     const chatId = String(msg.chat.id);
     const text = msg.text.trim();
@@ -355,7 +354,6 @@ async function sendBuyPlans(chatId) {
 }
 
 bot.on('callback_query', async (query) => {
-    if (global.__JPW_LICENSE_ACTIVE !== true) return;
     const chatId = String(query.message.chat.id);
     const messageId = query.message.message_id;
     const data = query.data;

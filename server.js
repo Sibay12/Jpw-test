@@ -18,8 +18,6 @@ const { debugLog, getRecentLogs, getAllLogs, getLogFilePath } = require('./utils
 const { buildXlsx } = require('./utils/xlsx');
 const adsModule = require('./adsModule');
 const { startKeepAlive, keepAliveMiddleware, getPublicBase } = require('./utils/keepAlive');
-const centralLicense = require('./utils/centralLicense');
-let licensedSubsystemsStarted = false;
 
 let shuttingDown = false;
 let httpServer = null;
@@ -68,54 +66,6 @@ app.use('/api', requestRateLimit({ windowMs: 60000, max: 180 }));
 setInterval(() => { const now = Date.now(); for (const [k, v] of requestBuckets) if (v.resetAt <= now) requestBuckets.delete(k); }, 60000).unref();
 // Lightweight health endpoint (used by the Render anti-sleep auto-ping)
 app.get('/health', (req, res) => { res.status(200).json({ status: 'ok', uptime: Math.round(process.uptime()) }); });
-
-// ================= CENTRAL TAKNA LICENSE LOCK =================
-// The browser never receives the central license key or any server secret.
-// Activation and verification are server-to-server over HTTPS.
-app.get('/license', (req, res) => res.sendFile(path.join(__dirname, 'public', 'license.html')));
-app.get('/api/license/status', async (req, res) => {
-    try {
-        const db = mongoose.connection.db;
-        if (!db) return res.status(503).json({ success: false, active: false, message: 'Database is not ready.' });
-        const saved = await db.collection('productlicenses').findOne({ _id: centralLicense.PRODUCT_CODE });
-        res.set('Cache-Control', 'no-store');
-        return res.json({
-            success: true,
-            active: !!(saved && saved.status === 'ACTIVE'),
-            product: centralLicense.PRODUCT_CODE,
-            status: saved?.status || 'UNLICENSED',
-            domain: saved?.domain || centralLicense.getDomain(req),
-            customer: saved?.customer || '',
-            expiresAt: saved?.expiresAt || null
-        });
-    } catch (e) { return res.status(500).json({ success: false, active: false, message: 'Could not read license status.' }); }
-});
-app.post('/api/license/activate', requestRateLimit({ windowMs: 60000, max: 8, keyPrefix: 'license-activate' }), async (req, res) => {
-    try {
-        if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return res.status(503).json({ success: false, message: 'Database is still connecting. Try again shortly.' });
-        const result = await centralLicense.activate(mongoose.connection.db, req, req.body?.licenseKey, req.body?.owner);
-        global.__JPW_LICENSE_ACTIVE = true;
-        await startLicensedSubsystems();
-        return res.json({ success: true, active: true, product: centralLicense.PRODUCT_CODE, license: result });
-    } catch (e) {
-        debugLog('License', 'Activation rejected:', e.message);
-        return res.status(e.statusCode || 400).json({ success: false, active: false, message: e.message });
-    }
-});
-app.post('/api/license/verify', requestRateLimit({ windowMs: 60000, max: 8, keyPrefix: 'license-verify' }), async (req, res) => {
-    try {
-        if (!mongoose.connection.db) return res.status(503).json({ success: false, active: false, message: 'Database is not ready.' });
-        const result = await centralLicense.verifyStored(mongoose.connection.db, req, true);
-        global.__JPW_LICENSE_ACTIVE = !!result.active;
-        if (!result.active) return res.status(423).json({ success: false, active: false, message: result.message });
-        return res.json({ success: true, active: true, product: centralLicense.PRODUCT_CODE, features: result.features || [] });
-    } catch (e) { return res.status(503).json({ success: false, active: false, message: 'License verification is unavailable.' }); }
-});
-
-// Fail closed: every application page/API is locked until the central authority confirms a valid license.
-// Health and license activation/status endpoints remain reachable so an owner can activate or recover.
-app.use(centralLicense.licenseGate(() => mongoose.connection.db));
-
 
 // ================= 🛠️ MAINTENANCE MODE =================
 // One switch in the Admin Panel. While ON: every portal page shows the maintenance page (no login possible),
@@ -632,7 +582,6 @@ async function notifyAdminAndUser(order, messageText) {
 function startSmartGreetingsTimer() {
     setInterval(async () => {
         try {
-            if (global.__JPW_LICENSE_ACTIVE !== true) return;
             if (maintenance.enabled) return; // no greetings while the system is in maintenance
             const users = await UserModel.find({ telegramChatId: { $not: /^(WEB_|wa:)/ } });
             if (users.length === 0 || !CUSTOMER_BOT_TOKEN) return;
@@ -697,7 +646,6 @@ async function spendOneCoin(telegramChatId) {
 function startPackageExpiryTimer() {
     setInterval(async () => {
         try {
-            if (global.__JPW_LICENSE_ACTIVE !== true) return;
             const now = new Date();
             const expiredUsers = await UserModel.find({ packageExpiryTime: { $lte: now } });
 
@@ -957,7 +905,6 @@ async function initUserbotBridge() {
         // each other and overwrite the order's status out of order.
         let botMsgChain = Promise.resolve();
         const queueBotMessage = (message, fromPoll = false) => {
-            if (global.__JPW_LICENSE_ACTIVE !== true) return Promise.resolve();
             const job = botMsgChain.then(() => handleBotMessage(message, fromPoll));
             botMsgChain = job.catch(() => {});
             return botMsgChain;
@@ -1178,7 +1125,7 @@ app.post('/api/admin/maintenance', requireAdminAuth, async (req, res) => {
 // ---- orders still not finished after 30 minutes are cancelled and the coin is refunded ----
 const ORDER_TIMEOUT_MS = 30 * 60 * 1000;
 async function cancelStaleOrders() {
-    if (global.__JPW_LICENSE_ACTIVE !== true || mongoose.connection.readyState !== 1) return;
+    if (mongoose.connection.readyState !== 1) return;
     try {
         const active = ['Pending', 'Accepted', 'In Progress'];
         const stale = await OrderModel.find({ status: { $in: active }, createdAt: { $lt: new Date(Date.now() - ORDER_TIMEOUT_MS) } }).select('_id telegramChatId targetId workOrderId').lean();
@@ -1561,9 +1508,8 @@ app.post('/api/admin/wa/test-message', requireAdminAuth, async (req, res) => {
 });
 
 let mongoAttempt = 0;
-async function startLicensedSubsystems() {
-    if (licensedSubsystemsStarted || mongoose.connection.readyState !== 1 || global.__JPW_LICENSE_ACTIVE !== true) return;
-    licensedSubsystemsStarted = true;
+async function onMongoConnected() {
+    debugLog('Server', '✅ MongoDB connected.');
     try { startGatewayQueueWorker(); debugLog('GatewayQueue', 'Durable FIFO worker started.'); } catch (e) { debugLog('GatewayQueue', 'Worker start failed:', e.message); }
     try { await loadServiceHours(); } catch (e) { debugLog('Server', 'loadServiceHours:', e.message); }
     try { await loadSheetUrl(); } catch (e) { debugLog('Server', 'loadSheetUrl:', e.message); }
@@ -1571,23 +1517,6 @@ async function startLicensedSubsystems() {
     const steps = [loadMaintenance, loadReachPricing, initAllBots, startEmbeddedBot, initUserbotBridge, startSmartGreetingsTimer, startPackageExpiryTimer, startOrderTimeoutSweeper, () => wa.autoStart(), reloadSelected, () => waSel.autoStart()];
     for (const step of steps) {
         try { await step(); } catch (e) { debugLog('Server', `startup step ${step.name} failed:`, e.message); }
-    }
-}
-async function onMongoConnected() {
-    debugLog('Server', '✅ MongoDB connected.');
-    try {
-        const configuredHost = String(process.env.LICENSE_DOMAIN || '').trim();
-        const publicHost = configuredHost || (() => { try { return new URL(process.env.SERVER_PUBLIC_URL || '').hostname; } catch (_) { return ''; } })();
-        const result = await centralLicense.verifyStored(mongoose.connection.db, { hostname: publicHost }, true);
-        global.__JPW_LICENSE_ACTIVE = !!result.active;
-        if (!result.active) {
-            debugLog('License', `Application locked until a valid JPW license is activated: ${result.message || 'No license found.'}`);
-            return;
-        }
-        await startLicensedSubsystems();
-    } catch (e) {
-        global.__JPW_LICENSE_ACTIVE = false;
-        debugLog('License', 'Central license verification failed; application remains locked:', e.message);
     }
 }
 function connectMongoWithRetry() {
@@ -1620,27 +1549,7 @@ function startEmbeddedBot() {
     debugLog('Bot', '✅ bot.js started inside the server process.');
 }
 
-
 connectMongoWithRetry();
-
-// Re-check an installed license periodically. A failed/revoked license disables all inbound
-// bot handlers and the HTTP gate; a later reactivation can start licensed services again.
-setInterval(async () => {
-    try {
-        if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return;
-        const saved = await mongoose.connection.db.collection('productlicenses').findOne({ _id: centralLicense.PRODUCT_CODE });
-        if (!saved || !saved.licenseKeyEncrypted) return;
-        const domain = String(process.env.LICENSE_DOMAIN || '').trim() || saved.domain || '';
-        const result = await centralLicense.verifyStored(mongoose.connection.db, { hostname: domain }, true);
-        global.__JPW_LICENSE_ACTIVE = !!result.active;
-        if (result.active) await startLicensedSubsystems();
-        else debugLog('License', `Periodic verification failed; product features are locked: ${result.message || 'License inactive.'}`);
-    } catch (e) {
-        global.__JPW_LICENSE_ACTIVE = false;
-        debugLog('License', 'Periodic verification unavailable; product features are locked:', e.message);
-    }
-}, 15 * 60 * 1000).unref();
-
 
 // Tenant data partitioning: query middleware adds the authenticated tenant ID to
 // every read/update/delete/aggregate on tenant-owned collections. Legacy requests
@@ -4938,7 +4847,6 @@ let gatewayQueueTimer = null;
 let gatewayQueueBusy = false;
 const GATEWAY_QUEUE_RETRY_MS = [10000, 30000, 90000];
 async function processOneGatewayQueueJob() {
-    if (global.__JPW_LICENSE_ACTIVE !== true) return;
     if (gatewayQueueBusy || mongoose.connection.readyState !== 1) return;
     gatewayQueueBusy = true;
     let job = null;

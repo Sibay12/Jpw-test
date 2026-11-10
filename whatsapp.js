@@ -305,7 +305,6 @@ module.exports = function createWhatsApp({ mongoose, debugLog: baseLog, name = '
             });
 
             s.ev.on('messages.upsert', ({ messages, type }) => {
-                if (global.__JPW_LICENSE_ACTIVE !== true) return;
                 if (type !== 'notify') return;
                 for (const m of messages || []) {
                     try {

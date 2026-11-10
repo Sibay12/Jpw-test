@@ -88,7 +88,3 @@ The v2.16.1 source audit records that full tenant-aware UI, tenant-specific paym
 
 ## 8. Rollback
 Keep v2.16.0 and v2.16.1 archives and database backups. A fresh install can be rolled back by redeploying the previous source against its own compatible database backup. Do not point an older application build at a database whose schema or encrypted fields have been changed unless a tested rollback plan exists.
-
-
-## 9. Central JPW license activation
-Before opening the customer-facing application, configure the central license portal and register product `JPW` as ACTIVE in Product & Feature Registry. The product code `JPW` is built into the backend. The API URL defaults to `https://license.takna.online/api/v1`; optionally set `LICENSE_API_BASE` to an HTTP or HTTPS URL ending in `/api/v1` (HTTPS strongly recommended). Set `LICENSE_DOMAIN` (if required by your deployment) and a stable `DATA_ENCRYPTION_KEY` in Render. Deploy JPW, visit `/license`, and enter the issued key. Without successful central activation/verification the application remains locked. See `LICENSE-INTEGRATION.md` for the exact API contract and central portal setup. The integration uses the central Activate/Verify endpoints only; it does not put HMAC secrets in the customer package.
