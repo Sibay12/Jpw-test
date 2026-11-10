@@ -5,6 +5,9 @@ const cors = require('cors');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
+const { encryptSensitive, decryptSensitive } = require('./utils/fieldEncryption');
+const tenantContext = new AsyncLocalStorage();
 const zlib = require('zlib');
 const { hashPassword, verifyPassword } = require('./utils/passwords');
 const TelegramBot = require('node-telegram-bot-api');
@@ -15,22 +18,104 @@ const { debugLog, getRecentLogs, getAllLogs, getLogFilePath } = require('./utils
 const { buildXlsx } = require('./utils/xlsx');
 const adsModule = require('./adsModule');
 const { startKeepAlive, keepAliveMiddleware, getPublicBase } = require('./utils/keepAlive');
+const centralLicense = require('./utils/centralLicense');
+let licensedSubsystemsStarted = false;
 
-process.on('uncaughtException', (err) => {
-    debugLog('CrashGuard', 'Uncaught Exception:', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-    debugLog('CrashGuard', 'Unhandled Rejection:', reason);
-});
+let shuttingDown = false;
+let httpServer = null;
+function gracefulFatalShutdown(kind, error) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try { debugLog('CrashGuard', `${kind}:`, error && (error.stack || error.message) || String(error)); } catch (_) {}
+    // An uncaught exception can leave the process in an unknown state. Stop accepting
+    // traffic and exit so Render can restart a clean process.
+    try { if (httpServer && httpServer.listening) httpServer.close(() => process.exit(1)); } catch (_) {}
+    setTimeout(() => process.exit(1), 10000).unref();
+}
+process.on('uncaughtException', err => gracefulFatalShutdown('Uncaught Exception', err));
+process.on('unhandledRejection', reason => gracefulFatalShutdown('Unhandled Rejection', reason));
 
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a proxy -> correct client IP / https
-app.use(express.json({ limit: '3mb' }));   // 3 MB: offer images (max 1 MB) travel as base64
+app.use(express.json({ limit: '3mb', verify: (req, res, buf) => { req.rawBody = Buffer.from(buf); } })); // retain exact bytes for signed webhooks
 app.use(express.urlencoded({ extended: true }));
-app.use(cors());
+const CORS_ORIGINS = String(process.env.CORS_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || CORS_ORIGINS.includes(origin)) return callback(null, true);
+        return callback(null, false); // disallowed cross-origin response gets no CORS headers; same-origin remains unaffected
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Token', 'X-Admin-Pass', 'X-Internal-Secret', 'X-Tenant-Key', 'X-Api-Key', 'X-Webhook-Signature']
+}));
 app.use(keepAliveMiddleware); // learns the public URL automatically for the self-ping
+// Shared-process request throttling. Use Redis-backed limits when scaling to multiple instances.
+const requestBuckets = new Map();
+function requestRateLimit({ windowMs = 60000, max = 120, keyPrefix = 'api' } = {}) {
+    return (req, res, next) => {
+        const key = `${keyPrefix}:${req.ip || req.socket.remoteAddress || 'unknown'}`;
+        const now = Date.now(); let bucket = requestBuckets.get(key);
+        if (!bucket || bucket.resetAt <= now) { bucket = { count: 0, resetAt: now + windowMs }; requestBuckets.set(key, bucket); }
+        bucket.count++;
+        res.setHeader('RateLimit-Limit', String(max));
+        res.setHeader('RateLimit-Remaining', String(Math.max(0, max - bucket.count)));
+        if (bucket.count > max) { res.setHeader('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000))); return res.status(429).json({ success: false, message: 'Too many requests. Please try again later.' }); }
+        next();
+    };
+}
+app.use('/api', requestRateLimit({ windowMs: 60000, max: 180 }));
+setInterval(() => { const now = Date.now(); for (const [k, v] of requestBuckets) if (v.resetAt <= now) requestBuckets.delete(k); }, 60000).unref();
 // Lightweight health endpoint (used by the Render anti-sleep auto-ping)
 app.get('/health', (req, res) => { res.status(200).json({ status: 'ok', uptime: Math.round(process.uptime()) }); });
+
+// ================= CENTRAL TAKNA LICENSE LOCK =================
+// The browser never receives the central license key or any server secret.
+// Activation and verification are server-to-server over HTTPS.
+app.get('/license', (req, res) => res.sendFile(path.join(__dirname, 'public', 'license.html')));
+app.get('/api/license/status', async (req, res) => {
+    try {
+        const db = mongoose.connection.db;
+        if (!db) return res.status(503).json({ success: false, active: false, message: 'Database is not ready.' });
+        const saved = await db.collection('productlicenses').findOne({ _id: centralLicense.PRODUCT_CODE });
+        res.set('Cache-Control', 'no-store');
+        return res.json({
+            success: true,
+            active: !!(saved && saved.status === 'ACTIVE'),
+            product: centralLicense.PRODUCT_CODE,
+            status: saved?.status || 'UNLICENSED',
+            domain: saved?.domain || centralLicense.getDomain(req),
+            customer: saved?.customer || '',
+            expiresAt: saved?.expiresAt || null
+        });
+    } catch (e) { return res.status(500).json({ success: false, active: false, message: 'Could not read license status.' }); }
+});
+app.post('/api/license/activate', requestRateLimit({ windowMs: 60000, max: 8, keyPrefix: 'license-activate' }), async (req, res) => {
+    try {
+        if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return res.status(503).json({ success: false, message: 'Database is still connecting. Try again shortly.' });
+        const result = await centralLicense.activate(mongoose.connection.db, req, req.body?.licenseKey, req.body?.owner);
+        global.__JPW_LICENSE_ACTIVE = true;
+        await startLicensedSubsystems();
+        return res.json({ success: true, active: true, product: centralLicense.PRODUCT_CODE, license: result });
+    } catch (e) {
+        debugLog('License', 'Activation rejected:', e.message);
+        return res.status(e.statusCode || 400).json({ success: false, active: false, message: e.message });
+    }
+});
+app.post('/api/license/verify', requestRateLimit({ windowMs: 60000, max: 8, keyPrefix: 'license-verify' }), async (req, res) => {
+    try {
+        if (!mongoose.connection.db) return res.status(503).json({ success: false, active: false, message: 'Database is not ready.' });
+        const result = await centralLicense.verifyStored(mongoose.connection.db, req, true);
+        global.__JPW_LICENSE_ACTIVE = !!result.active;
+        if (!result.active) return res.status(423).json({ success: false, active: false, message: result.message });
+        return res.json({ success: true, active: true, product: centralLicense.PRODUCT_CODE, features: result.features || [] });
+    } catch (e) { return res.status(503).json({ success: false, active: false, message: 'License verification is unavailable.' }); }
+});
+
+// Fail closed: every application page/API is locked until the central authority confirms a valid license.
+// Health and license activation/status endpoints remain reachable so an owner can activate or recover.
+app.use(centralLicense.licenseGate(() => mongoose.connection.db));
+
 
 // ================= 🛠️ MAINTENANCE MODE =================
 // One switch in the Admin Panel. While ON: every portal page shows the maintenance page (no login possible),
@@ -175,6 +260,22 @@ function readToken(token) {
         if (!safeEqual(sig, good)) return null;
         return Buffer.from(body, 'base64url').toString();
     } catch (e) { return null; }
+}
+function issueTenantToken(chatId, tenantId) {
+    const body = Buffer.from(JSON.stringify({ chatId: String(chatId), tenantId: String(tenantId) })).toString('base64url');
+    const exp = Date.now() + SESSION_DAYS * 86400000;
+    const sig = crypto.createHmac('sha256', SESSION_SECRET).update(`${body}.${exp}`).digest('hex');
+    return `${body}.${exp}.${sig}`;
+}
+function readTenantToken(token) {
+    try {
+        const [body, exp, sig] = String(token || '').split('.');
+        if (!body || !exp || !sig || Number(exp) < Date.now()) return null;
+        const good = crypto.createHmac('sha256', SESSION_SECRET).update(`${body}.${exp}`).digest('hex');
+        if (!safeEqual(sig, good)) return null;
+        const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        return parsed && parsed.chatId && parsed.tenantId ? parsed : null;
+    } catch (_) { return null; }
 }
 function tokenFromReq(req) {
     return String(req.headers.authorization || '').replace(/^Bearer\s+/i, '') || String(req.headers['x-user-token'] || '');
@@ -531,6 +632,7 @@ async function notifyAdminAndUser(order, messageText) {
 function startSmartGreetingsTimer() {
     setInterval(async () => {
         try {
+            if (global.__JPW_LICENSE_ACTIVE !== true) return;
             if (maintenance.enabled) return; // no greetings while the system is in maintenance
             const users = await UserModel.find({ telegramChatId: { $not: /^(WEB_|wa:)/ } });
             if (users.length === 0 || !CUSTOMER_BOT_TOKEN) return;
@@ -595,6 +697,7 @@ async function spendOneCoin(telegramChatId) {
 function startPackageExpiryTimer() {
     setInterval(async () => {
         try {
+            if (global.__JPW_LICENSE_ACTIVE !== true) return;
             const now = new Date();
             const expiredUsers = await UserModel.find({ packageExpiryTime: { $lte: now } });
 
@@ -694,7 +797,7 @@ async function initUserbotBridge() {
                 let matchedOrder = pendingOrders.find(o => o.botMsgId && o.botMsgId === mid);
                 let matchedVia = matchedOrder ? 'message id' : '';
                 if (!matchedOrder) {
-                    matchedOrder = pendingOrders.find(o => rawText.includes(o.targetId) || rawText.includes(o.targetPass));
+                    matchedOrder = pendingOrders.find(o => rawText.includes(o.targetId) || rawText.includes(decryptSensitive(o.targetPass)));
                     if (matchedOrder) matchedVia = 'target id/password in text';
                 }
                 if (!matchedOrder) {   // same Tech ID written differently (leading zeros, spaces)
@@ -720,6 +823,23 @@ async function initUserbotBridge() {
                 if (alreadyHandledBotMessage(message, rawText)) { logEntry.note = 'skipped: same text already handled'; return; }
 
                 const order = matchedOrder;
+                const telegramRulesConfig = await getGatewayReplyRules();
+                const telegramRuleEvaluation = evaluateGatewayReplyRules(rawText, telegramRulesConfig, 'telegram');
+                const telegramCustomCustomerMessage = telegramRulesConfig.notifyCustomer && telegramRuleEvaluation.matched && telegramRuleEvaluation.customerMessage
+                    ? renderGatewayCustomerTemplate(telegramRuleEvaluation.customerMessage, order, telegramRuleEvaluation) : '';
+                logEntry.replyClassification = telegramRuleEvaluation.classification;
+                logEntry.matchedRule = telegramRuleEvaluation.ruleId || '';
+                order.gatewayReplies = Array.isArray(order.gatewayReplies) ? order.gatewayReplies : [];
+                const existingReplyIndex = order.gatewayReplies.findIndex(r => r && r.channel === 'telegram' && String(r.messageId) === mid);
+                const telegramReplyRecord = { channel: 'telegram', messageId: mid, receivedAt: new Date(), matchedBy,
+                    classification: telegramRuleEvaluation.classification, ruleId: telegramRuleEvaluation.ruleId || '',
+                    customerNoticeText: telegramRuleEvaluation.customerMessage || '', customerNoticeSent: !!telegramCustomCustomerMessage,
+                    text: String(rawText).slice(0, 4000) };
+                if (existingReplyIndex >= 0) order.gatewayReplies[existingReplyIndex] = telegramReplyRecord;
+                else order.gatewayReplies.push(telegramReplyRecord);
+                order.gatewayReplies = order.gatewayReplies.slice(-25);
+                order.gatewayReplyState = telegramRuleEvaluation.classification;
+                order.gatewayReplyUpdatedAt = new Date();
                 logEntry.orderId = String(order._id); logEntry.targetId = order.targetId;
                 const cleanedText = sanitizeCustomerMessage(rawText);
                 order.adminReply = cleanedText;
@@ -773,7 +893,7 @@ async function initUserbotBridge() {
                     order.adminReply = plainText(successReplyFormat);
                     await order.save();
 
-                    await sendCustomerMessage(customerBot, order.telegramChatId, successReplyFormat);
+                    await sendCustomerMessage(customerBot, order.telegramChatId, telegramCustomCustomerMessage || successReplyFormat);
                     if (adminBot) await adminBot.sendMessage(ADMIN_CHAT_ID, `🎉 **Order Complete & Commission Credited:** \`${order.targetId}\`\n\n${rawText}`, { parse_mode: 'Markdown' }).catch(err => debugLog('Userbot', 'Admin notify failed:', err.message));
                 }
                 else if (text.includes('locked') || text.includes('alert ls') || text.includes('account is locked') || text.includes('login failed') || text.includes('invalid credentials') || text.includes('reject') || text.includes('fail') || text.includes('error') || text.includes('status: fail') || text.includes('not verified') || text.includes('not reached') || text.includes('cancel')) {
@@ -800,14 +920,14 @@ async function initUserbotBridge() {
                         status: 'Rejected'
                     });
 
-                    await sendCustomerMessage(customerBot, order.telegramChatId, failReply);
+                    await sendCustomerMessage(customerBot, order.telegramChatId, telegramCustomCustomerMessage || failReply);
                     if (adminBot) await adminBot.sendMessage(ADMIN_CHAT_ID, `❌ **Order Rejected:** \`${order.targetId}\`\n\n${rawText}`, { parse_mode: 'Markdown' }).catch(()=>{});
                 }
                 else if (text.includes('security check') || text.includes('completed in') || text.includes('queued') || text.includes('queue:') || text.includes('starting reach') || text.includes('still reaching') || text.includes('processing your reach') || text.includes('processing reach') || text.includes('working on reach')) {
                     logEntry.note = '→ In Progress';
                     order.status = 'In Progress';
                     await order.save();
-                    if (text.includes('completed in')) startAutoRecheck(order._id, order.targetId, order.targetPass);
+                    if (text.includes('completed in')) startAutoRecheck(order._id, order.targetId, decryptSensitive(order.targetPass));
                     const progKind = text.includes('completed in') ? 'verifying'
                         : text.includes('security check') ? 'checking'
                         : (text.includes('queued') || text.includes('queue:')) ? 'queued'
@@ -816,7 +936,7 @@ async function initUserbotBridge() {
                     const progReply = buildCustomerMessage(progKind, { targetId: order.targetId, rawText });
                     order.adminReply = plainText(progReply);
                     await order.save();
-                    await sendCustomerMessage(customerBot, order.telegramChatId, progReply);
+                    await sendCustomerMessage(customerBot, order.telegramChatId, telegramCustomCustomerMessage || progReply);
                 } else {
                     logEntry.note = '→ unrecognized reply pattern, moved to In Progress';
                     // Unrecognized reply pattern: the service did answer, so the order is no longer "Pending".
@@ -825,6 +945,7 @@ async function initUserbotBridge() {
                     const recvReply = buildCustomerMessage('received', { targetId: order.targetId });
                     order.adminReply = plainText(recvReply);
                     await order.save();
+                    if (telegramCustomCustomerMessage) await sendCustomerMessage(customerBot, order.telegramChatId, telegramCustomCustomerMessage);
                     debugLog('Userbot', `Unrecognized reply pattern for order ${order._id}: ${rawText.slice(0, 200)}`);
                 }
             } catch (err) {
@@ -836,6 +957,7 @@ async function initUserbotBridge() {
         // each other and overwrite the order's status out of order.
         let botMsgChain = Promise.resolve();
         const queueBotMessage = (message, fromPoll = false) => {
+            if (global.__JPW_LICENSE_ACTIVE !== true) return Promise.resolve();
             const job = botMsgChain.then(() => handleBotMessage(message, fromPoll));
             botMsgChain = job.catch(() => {});
             return botMsgChain;
@@ -1056,7 +1178,7 @@ app.post('/api/admin/maintenance', requireAdminAuth, async (req, res) => {
 // ---- orders still not finished after 30 minutes are cancelled and the coin is refunded ----
 const ORDER_TIMEOUT_MS = 30 * 60 * 1000;
 async function cancelStaleOrders() {
-    if (mongoose.connection.readyState !== 1) return;
+    if (global.__JPW_LICENSE_ACTIVE !== true || mongoose.connection.readyState !== 1) return;
     try {
         const active = ['Pending', 'Accepted', 'In Progress'];
         const stale = await OrderModel.find({ status: { $in: active }, createdAt: { $lt: new Date(Date.now() - ORDER_TIMEOUT_MS) } }).select('_id telegramChatId targetId workOrderId').lean();
@@ -1099,7 +1221,7 @@ app.post('/api/admin/test-order', requireAdminAuth, async (req, res) => {
     try {
         const running = await findRunningOrderForId(targetId);
         if (running) return res.json({ success: false, message: '⏳ An order for this ID is already active (maybe a real customer order). Wait until it finishes, or cancel it from the list.' });
-        const order = await OrderModel.create({ telegramChatId: 'ADMIN_TEST', targetId, targetPass, isTest: true });
+        const order = await OrderModel.create({ telegramChatId: 'ADMIN_TEST', targetId, targetPass: encryptSensitive(targetPass), isTest: true });
         const sent = await forwardOrderToTargetBot(targetId, targetPass);
         if (!sent) {
             order.status = 'Rejected';
@@ -1222,9 +1344,9 @@ async function getGatewayRoutingConfig() {
 const DEFAULT_GATEWAY_REPLY_RULES = {
     enabled: false, notifyCustomer: false,
     rules: [
-        { id: 'success-default', enabled: true, keyword: 'status: success', matchMode: 'contains', classification: 'success_candidate', customerMessage: 'Your request for {targetId} has received a success update.', extractPattern: '', extractLabel: '' },
-        { id: 'failure-default', enabled: true, keyword: 'status: failed', matchMode: 'contains', classification: 'failure_candidate', customerMessage: 'There is an issue with your request for {targetId}. Our team will review it.', extractPattern: '', extractLabel: '' },
-        { id: 'progress-default', enabled: true, keyword: 'processing', matchMode: 'contains', classification: 'in_progress', customerMessage: 'Your request for {targetId} is currently being processed.', extractPattern: '', extractLabel: '' }
+        { id: 'success-default', enabled: true, channel: 'both', keyword: 'status: success', matchMode: 'contains', classification: 'success_candidate', customerMessage: 'Your request for {targetId} has received a success update.', approxTime: 0, extractPattern: '', extractLabel: '' },
+        { id: 'failure-default', enabled: true, channel: 'both', keyword: 'status: failed', matchMode: 'contains', classification: 'failure_candidate', customerMessage: 'There is an issue with your request for {targetId}. Our team will review it.', approxTime: 0, extractPattern: '', extractLabel: '' },
+        { id: 'progress-default', enabled: true, channel: 'both', keyword: 'processing', matchMode: 'contains', classification: 'in_progress', customerMessage: 'Your request for {targetId} is currently being processed.', approxTime: 0, extractPattern: '', extractLabel: '' }
     ], updatedAt: null
 };
 async function getGatewayReplyRules() {
@@ -1242,15 +1364,123 @@ function sanitizeGatewayReplyRules(input) {
     const allowed = ['success_candidate', 'failure_candidate', 'in_progress', 'unclassified'];
     const rules = (Array.isArray(b.rules) ? b.rules : []).slice(0, 30).map((r, i) => ({
         id: String(r.id || `rule-${i + 1}`).replace(/[^a-z0-9_-]/gi, '').slice(0, 40) || `rule-${i + 1}`,
-        enabled: r.enabled !== false, keyword: String(r.keyword || '').trim().slice(0, 120),
-        matchMode: r.matchMode === 'exact' ? 'exact' : 'contains',
+        enabled: r.enabled !== false, channel: ['whatsapp', 'telegram'].includes(r.channel) ? r.channel : 'both',
+        keyword: String(r.keyword || '').trim().slice(0, 500),
+        matchMode: ['exact', 'contains', 'regex'].includes(r.matchMode) ? r.matchMode : 'contains',
         classification: allowed.includes(r.classification) ? r.classification : 'unclassified',
-        customerMessage: String(r.customerMessage || '').trim().slice(0, 500),
+        customerMessage: String(r.customerMessage || '').trim().slice(0, 900),
+        approxTime: Math.max(0, Math.min(10080, Number.isFinite(Number(r.approxTime)) ? Math.floor(Number(r.approxTime)) : 0)),
         extractPattern: String(r.extractPattern || '').trim().slice(0, 160),
         extractLabel: String(r.extractLabel || '').trim().slice(0, 40)
     })).filter(r => r.keyword);
     return { enabled: b.enabled === true, notifyCustomer: b.notifyCustomer === true, rules, updatedAt: new Date().toISOString() };
 }
+
+// White-label branding: environment variables provide defaults; Admin Panel values override them.
+// Set BRANDING_ENV_LOCK=true to force environment values over Admin Panel values.
+const BRANDING_ENV_LOCK = /^(1|true|yes)$/i.test(String(process.env.BRANDING_ENV_LOCK || ''));
+const BRANDING_ENV_DEFAULTS = {
+    siteName: String(process.env.SITE_NAME || 'JPW').trim().slice(0, 60),
+    tagline: String(process.env.SITE_TAGLINE || '').trim().slice(0, 120),
+    logoUrl: String(process.env.SITE_LOGO_URL || '').trim().slice(0, 2048)
+};
+async function getPublicBranding() {
+    let saved = {};
+    try {
+        const doc = await SettingModel.findOne({ key: 'siteBranding' }).lean();
+        if (doc && doc.value) saved = JSON.parse(doc.value) || {};
+    } catch (e) { debugLog('Branding', 'Could not load saved branding:', e.message); }
+    const chosen = BRANDING_ENV_LOCK
+        ? { ...saved, ...BRANDING_ENV_DEFAULTS }
+        : { ...BRANDING_ENV_DEFAULTS, ...saved };
+    return {
+        siteName: String(chosen.siteName || BRANDING_ENV_DEFAULTS.siteName || 'JPW').trim().slice(0, 60),
+        tagline: String(chosen.tagline || '').trim().slice(0, 120),
+        logoUrl: String(chosen.logoUrl || '').trim().slice(0, 1500000),
+        envLocked: BRANDING_ENV_LOCK,
+        envConfigured: !!(process.env.SITE_NAME || process.env.SITE_TAGLINE || process.env.SITE_LOGO_URL)
+    };
+}
+app.get('/api/public/branding', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, branding: await getPublicBranding() });
+});
+app.get('/api/admin/branding', requireAdminAuth, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, branding: await getPublicBranding() });
+});
+app.post('/api/admin/branding', requireAdminAuth, async (req, res) => {
+    try {
+        const b = req.body || {};
+        if (BRANDING_ENV_LOCK) return res.status(403).json({ success: false, message: 'Branding is locked by environment variables (BRANDING_ENV_LOCK=true).' });
+        const siteName = String(b.siteName || '').trim().replace(/[<>]/g, '').slice(0, 60);
+        const tagline = String(b.tagline || '').trim().replace(/[<>]/g, '').slice(0, 120);
+        let logoUrl = String(b.logoUrl || '').trim();
+        if (logoUrl.length > 1500000) return res.status(413).json({ success: false, message: 'Logo is too large. Maximum upload size is 1 MB.' });
+        if (logoUrl && !/^https:\/\/[^\s"'<>]+$/i.test(logoUrl) &&
+            !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(logoUrl)) {
+            return res.status(400).json({ success: false, message: 'Logo must be a PNG, JPG, WebP upload or HTTPS image URL.' });
+        }
+        if (!siteName) return res.status(400).json({ success: false, message: 'Site name is required.' });
+        const config = { siteName, tagline, logoUrl, updatedAt: new Date().toISOString() };
+        await SettingModel.findOneAndUpdate({ key: 'siteBranding' },
+            { $set: { value: JSON.stringify(config), updatedAt: new Date() } }, { upsert: true, new: true });
+        res.set('Cache-Control', 'no-store');
+        res.json({ success: true, branding: await getPublicBranding(), message: 'Branding saved.' });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+
+// Three payment methods. Built-in UPI payments remain PENDING until independently verified.
+const DEFAULT_PAYMENT_METHODS = {
+    enabled: { teknapay: true, builtin: false, manual: false },
+    builtin: { upiId: '', merchantName: '', note: 'Pay using any UPI app. Payment will be verified before coins are credited.' },
+    manual: { upiId: '', accountName: '', instructions: 'Pay and submit the UTR/reference for admin verification.' },
+    updatedAt: null
+};
+async function getPaymentMethodsConfig() {
+    try {
+        const doc = await SettingModel.findOne({ key: 'paymentMethodsV1' }).lean();
+        const saved = doc && doc.value ? JSON.parse(doc.value) : {};
+        return { ...DEFAULT_PAYMENT_METHODS, ...saved,
+            enabled: { ...DEFAULT_PAYMENT_METHODS.enabled, ...(saved.enabled || {}) },
+            builtin: { ...DEFAULT_PAYMENT_METHODS.builtin, ...(saved.builtin || {}) },
+            manual: { ...DEFAULT_PAYMENT_METHODS.manual, ...(saved.manual || {}) } };
+    } catch (e) { return JSON.parse(JSON.stringify(DEFAULT_PAYMENT_METHODS)); }
+}
+app.get('/api/public/payment-methods', async (req,res) => {
+    const c=await getPaymentMethodsConfig();
+    res.set('Cache-Control','no-store');
+    res.json({success:true, methods:{
+        enabled:c.enabled,
+        builtin:{ merchantName:c.builtin.merchantName, note:c.builtin.note, configured:!!c.builtin.upiId },
+        manual:{ accountName:c.manual.accountName, instructions:c.manual.instructions, configured:!!c.manual.upiId }
+    }});
+});
+app.get('/api/admin/payment-methods', requireAdminAuth, async (req,res) => {
+    res.set('Cache-Control','no-store'); res.json({success:true,config:await getPaymentMethodsConfig()});
+});
+app.post('/api/admin/payment-methods', requireAdminAuth, async (req,res) => {
+    try {
+        const b=req.body||{}, enabled=b.enabled||{};
+        const upi=(v)=>String(v||'').trim().slice(0,120);
+        const validUpi=(v)=>!v || /^[A-Za-z0-9._-]{2,256}@[A-Za-z0-9.-]{2,64}$/.test(v);
+        const builtinUpi=upi(b.builtin&&b.builtin.upiId), manualUpi=upi(b.manual&&b.manual.upiId);
+        if(!validUpi(builtinUpi)||!validUpi(manualUpi)) return res.status(400).json({success:false,message:'Enter a valid UPI ID (example: merchant@bank).'});
+        const config={
+            enabled:{teknapay:enabled.teknapay===true,builtin:enabled.builtin===true,manual:enabled.manual===true},
+            builtin:{upiId:builtinUpi,merchantName:String(b.builtin&&b.builtin.merchantName||'').trim().slice(0,80),note:String(b.builtin&&b.builtin.note||'').trim().slice(0,300)},
+            manual:{upiId:manualUpi,accountName:String(b.manual&&b.manual.accountName||'').trim().slice(0,80),instructions:String(b.manual&&b.manual.instructions||'').trim().slice(0,500)},
+            updatedAt:new Date().toISOString()
+        };
+        if(config.enabled.builtin&&!builtinUpi) return res.status(400).json({success:false,message:'UPI ID is required to enable Built-in UPI.'});
+        if(config.enabled.manual&&!manualUpi) return res.status(400).json({success:false,message:'UPI ID is required to enable Manual Payment.'});
+        if(!Object.values(config.enabled).some(Boolean)) return res.status(400).json({success:false,message:'Enable at least one payment method.'});
+        await SettingModel.findOneAndUpdate({key:'paymentMethodsV1'},{$set:{value:JSON.stringify(config),updatedAt:new Date()}},{upsert:true});
+        res.json({success:true,config,message:'Payment methods saved.'});
+    } catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 app.get('/api/admin/gateway-reply-rules', requireAdminAuth, async (req, res) => {
     const config = await getGatewayReplyRules();
     res.set('Cache-Control', 'no-store');
@@ -1260,9 +1490,9 @@ app.post('/api/admin/gateway-reply-rules', requireAdminAuth, async (req, res) =>
     try {
         const config = sanitizeGatewayReplyRules(req.body || {});
         for (const rule of config.rules) {
-            if (rule.extractPattern) {
-                try { new RegExp(rule.extractPattern, 'i'); }
-                catch (_) { return res.status(400).json({ success: false, message: `Invalid extraction pattern in rule "${rule.id}".` }); }
+            if (rule.matchMode === 'regex') {
+                try { new RegExp(rule.keyword, 'i'); }
+                catch (_) { return res.status(400).json({ success: false, message: `Invalid regular expression in rule "${rule.id}".` }); }
             }
         }
         await SettingModel.findOneAndUpdate({ key: 'gatewayReplyRules' },
@@ -1331,8 +1561,9 @@ app.post('/api/admin/wa/test-message', requireAdminAuth, async (req, res) => {
 });
 
 let mongoAttempt = 0;
-async function onMongoConnected() {
-    debugLog('Server', '✅ MongoDB connected.');
+async function startLicensedSubsystems() {
+    if (licensedSubsystemsStarted || mongoose.connection.readyState !== 1 || global.__JPW_LICENSE_ACTIVE !== true) return;
+    licensedSubsystemsStarted = true;
     try { startGatewayQueueWorker(); debugLog('GatewayQueue', 'Durable FIFO worker started.'); } catch (e) { debugLog('GatewayQueue', 'Worker start failed:', e.message); }
     try { await loadServiceHours(); } catch (e) { debugLog('Server', 'loadServiceHours:', e.message); }
     try { await loadSheetUrl(); } catch (e) { debugLog('Server', 'loadSheetUrl:', e.message); }
@@ -1340,6 +1571,23 @@ async function onMongoConnected() {
     const steps = [loadMaintenance, loadReachPricing, initAllBots, startEmbeddedBot, initUserbotBridge, startSmartGreetingsTimer, startPackageExpiryTimer, startOrderTimeoutSweeper, () => wa.autoStart(), reloadSelected, () => waSel.autoStart()];
     for (const step of steps) {
         try { await step(); } catch (e) { debugLog('Server', `startup step ${step.name} failed:`, e.message); }
+    }
+}
+async function onMongoConnected() {
+    debugLog('Server', '✅ MongoDB connected.');
+    try {
+        const configuredHost = String(process.env.LICENSE_DOMAIN || '').trim();
+        const publicHost = configuredHost || (() => { try { return new URL(process.env.SERVER_PUBLIC_URL || '').hostname; } catch (_) { return ''; } })();
+        const result = await centralLicense.verifyStored(mongoose.connection.db, { hostname: publicHost }, true);
+        global.__JPW_LICENSE_ACTIVE = !!result.active;
+        if (!result.active) {
+            debugLog('License', `Application locked until a valid JPW license is activated: ${result.message || 'No license found.'}`);
+            return;
+        }
+        await startLicensedSubsystems();
+    } catch (e) {
+        global.__JPW_LICENSE_ACTIVE = false;
+        debugLog('License', 'Central license verification failed; application remains locked:', e.message);
     }
 }
 function connectMongoWithRetry() {
@@ -1372,20 +1620,71 @@ function startEmbeddedBot() {
     debugLog('Bot', '✅ bot.js started inside the server process.');
 }
 
+
 connectMongoWithRetry();
+
+// Re-check an installed license periodically. A failed/revoked license disables all inbound
+// bot handlers and the HTTP gate; a later reactivation can start licensed services again.
+setInterval(async () => {
+    try {
+        if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return;
+        const saved = await mongoose.connection.db.collection('productlicenses').findOne({ _id: centralLicense.PRODUCT_CODE });
+        if (!saved || !saved.licenseKeyEncrypted) return;
+        const domain = String(process.env.LICENSE_DOMAIN || '').trim() || saved.domain || '';
+        const result = await centralLicense.verifyStored(mongoose.connection.db, { hostname: domain }, true);
+        global.__JPW_LICENSE_ACTIVE = !!result.active;
+        if (result.active) await startLicensedSubsystems();
+        else debugLog('License', `Periodic verification failed; product features are locked: ${result.message || 'License inactive.'}`);
+    } catch (e) {
+        global.__JPW_LICENSE_ACTIVE = false;
+        debugLog('License', 'Periodic verification unavailable; product features are locked:', e.message);
+    }
+}, 15 * 60 * 1000).unref();
+
+
+// Tenant data partitioning: query middleware adds the authenticated tenant ID to
+// every read/update/delete/aggregate on tenant-owned collections. Legacy requests
+// without tenant context continue to operate only on the legacy workspace.
+function applyTenantIsolation(schema) {
+    schema.pre('save', function(next) {
+        const tenantId = tenantContext.getStore();
+        if (tenantId && !this.isNew && this.tenantId && this.tenantId !== tenantId) return next(new Error('Cross-tenant document mutation blocked.'));
+        if (tenantId && this.isNew) this.tenantId = tenantId;
+        next();
+    });
+    schema.pre(['find','findOne','countDocuments','distinct','updateOne','updateMany','findOneAndUpdate','findOneAndDelete','deleteOne','deleteMany','replaceOne'], function(next) {
+        const tenantId = tenantContext.getStore();
+        if (tenantId) {
+            this.setQuery({ ...(this.getQuery() || {}), tenantId });
+            const update = this.getUpdate();
+            if (update && !Array.isArray(update)) {
+                if (update.$set) delete update.$set.tenantId;
+                if (update.$setOnInsert) update.$setOnInsert.tenantId = tenantId;
+                delete update.tenantId;
+                this.setUpdate(update);
+            }
+        }
+        next();
+    });
+    schema.pre('aggregate', function(next) {
+        const tenantId = tenantContext.getStore();
+        if (tenantId) this.pipeline().unshift({ $match: { tenantId } });
+        next();
+    });
+}
 
 // --- SCHEMAS ---
 const userSchema = new mongoose.Schema({
     tenantId: { type: String, default: 'legacy', index: true },
-    telegramChatId: { type: String, required: true, unique: true },
-    customId: { type: String, unique: true, sparse: true },
+    telegramChatId: { type: String, required: true },
+    customId: { type: String, default: null },
     password: { type: String, default: null },
     name: { type: String, default: 'Engineer' },
     jpwCoins: { type: Number, default: 0 },                  // TOTAL coins shown to the user (package + bonus)
     bonusCoins: { type: Number, default: 0 },                // part of jpwCoins that came from Daily Bonus (does not expire)
     commissionBalance: { type: Number, default: 0.00 },      
     totalReferrals: { type: Number, default: 0 },
-    referralCode: { type: String, unique: true, sparse: true },
+    referralCode: { type: String, default: null },
     referredBy: { type: String, default: null },
     activePackage: { type: String, default: 'No active package' },
     lastPackageCoins: { type: Number, default: 0 },
@@ -1393,6 +1692,9 @@ const userSchema = new mongoose.Schema({
     lastBonusTime: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now }
 });
+userSchema.index({ tenantId: 1, telegramChatId: 1 }, { unique: true, name: 'tenant_telegramChatId_unique' });
+userSchema.index({ tenantId: 1, customId: 1 }, { unique: true, partialFilterExpression: { customId: { $type: 'string' } }, name: 'tenant_customId_unique' });
+userSchema.index({ tenantId: 1, referralCode: 1 }, { unique: true, partialFilterExpression: { referralCode: { $type: 'string' } }, name: 'tenant_referralCode_unique' });
 
 // 🔒 SECURITY FIX: never include the password hash when a User document is converted
 // to JSON (res.json() calls toJSON internally) — applies to every response automatically.
@@ -1439,8 +1741,10 @@ const callCompleteSchema = new mongoose.Schema({
 });
 
 const usedUtrSchema = new mongoose.Schema({
-    utrId: { type: String, required: true, unique: true }
+    tenantId: { type: String, default: 'legacy', index: true },
+    utrId: { type: String, required: true }
 });
+usedUtrSchema.index({ tenantId: 1, utrId: 1 }, { unique: true, name: 'tenant_usedutr_unique' });
 
 const announcementSchema = new mongoose.Schema({
     message: { type: String, required: true },
@@ -1449,13 +1753,23 @@ const announcementSchema = new mongoose.Schema({
 
 const paymentSchema = new mongoose.Schema({
     tenantId: { type: String, default: 'legacy', index: true },
-    orderId: { type: String, required: true, unique: true },
+    orderId: { type: String, required: true },
     amount: Number,
     coins: Number,
     telegramChatId: String,
     status: { type: String, default: 'PENDING' },
+    paymentMethod: { type: String, default: 'teknapay' },
+    merchantReference: { type: String, default: '' },
+    utr: { type: String, default: '' },
+    normalizedUtr: { type: String, default: null },
+    customerNote: { type: String, default: '' },
+    reviewedBy: { type: String, default: '' },
+    reviewedAt: { type: Date, default: null },
+    auditLog: { type: [mongoose.Schema.Types.Mixed], default: [] },
     createdAt: { type: Date, default: Date.now }
 });
+paymentSchema.index({ tenantId: 1, orderId: 1 }, { unique: true, name: 'tenant_payment_order_unique' });
+paymentSchema.index({ tenantId: 1, normalizedUtr: 1 }, { unique: true, partialFilterExpression: { normalizedUtr: { $type: 'string' } }, name: 'tenant_payment_utr_unique' });
 
 const settingSchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
@@ -1463,6 +1777,9 @@ const settingSchema = new mongoose.Schema({
     updatedAt: { type: Date, default: Date.now }
 });
 
+applyTenantIsolation(userSchema);
+applyTenantIsolation(orderSchema);
+applyTenantIsolation(paymentSchema);
 const UserModel = mongoose.model('User', userSchema);
 const OrderModel = mongoose.model('Order', orderSchema);
 
@@ -1482,12 +1799,84 @@ async function requireTenantAuth(req, res, next) {
         if (tenant.status === 'trial' && tenant.trialEndsAt && tenant.trialEndsAt < new Date())
             return res.status(403).json({ success: false, message: 'Tenant trial has expired.' });
         req.tenant = tenant;
-        next();
+        tenantContext.run(String(tenant.tenantId), () => next());
     } catch (e) { res.status(500).json({ success: false, message: 'Tenant authentication could not be completed.' }); }
 }
+async function requireTenantCustomer(req, res, next) {
+    try {
+        const identity = readTenantToken(tokenFromReq(req));
+        if (!identity) return res.status(401).json({ success: false, authExpired: true, message: 'Tenant customer session expired.' });
+        const tenant = await TenantModel.findOne({ tenantId: identity.tenantId }).lean();
+        if (!tenant || !['trial','active'].includes(tenant.status) || (tenant.status === 'trial' && tenant.trialEndsAt && tenant.trialEndsAt < new Date()))
+            return res.status(403).json({ success: false, message: 'Tenant workspace is not active.' });
+        req.tenant = tenant; req.authChatId = String(identity.chatId);
+        tenantContext.run(String(tenant.tenantId), () => next());
+    } catch (_) { return res.status(500).json({ success: false, message: 'Tenant session validation failed.' }); }
+}
+
 app.get('/api/tenant/context', requireTenantAuth, (req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json({ success: true, tenant: tenantPublicView(req.tenant) });
+});
+
+
+// Tenant-facing customer identity APIs. All tenant-owned model queries execute inside
+// AsyncLocalStorage tenant scope; the existing legacy UI/routes remain unchanged.
+async function getActiveTenantBySlug(slug) {
+    const tenant = await TenantModel.findOne({ slug: tenantSlug(slug) }).lean();
+    if (!tenant || !['trial','active'].includes(tenant.status) || (tenant.status === 'trial' && tenant.trialEndsAt && tenant.trialEndsAt < new Date())) return null;
+    return tenant;
+}
+app.post('/api/tenant/v1/register', async (req, res) => {
+    try {
+        const tenant = await getActiveTenantBySlug(req.body?.tenantSlug);
+        if (!tenant) return res.status(404).json({ success: false, message: 'Workspace not found or inactive.' });
+        const customId = String(req.body?.customId || '').trim();
+        const password = String(req.body?.password || '');
+        const name = String(req.body?.name || '').trim().slice(0, 60);
+        if (!/^[A-Za-z0-9._-]{3,30}$/.test(customId) || password.length < 8 || password.length > 128 || !name)
+            return res.status(400).json({ success: false, message: 'Enter a valid login ID, name and password (minimum 8 characters).' });
+        return tenantContext.run(String(tenant.tenantId), async () => {
+            const existing = await UserModel.findOne({ customId });
+            if (existing) return res.status(409).json({ success: false, message: 'Login ID is already in use.' });
+            const chatId = `WEB_${tenant.tenantId}_${crypto.randomBytes(12).toString('hex')}`;
+            const user = await UserModel.create({ tenantId: tenant.tenantId, telegramChatId: chatId, customId, password: await hashPassword(password), name, referralCode: await generateUniqueReferralCode() });
+            return res.status(201).json({ success: true, token: issueTenantToken(chatId, tenant.tenantId), user: { id: String(user._id), name: user.name, customId: user.customId, coins: user.jpwCoins || 0, tenant: tenant.slug } });
+        });
+    } catch (e) { return res.status(500).json({ success: false, message: 'Registration failed.' }); }
+});
+app.post('/api/tenant/v1/login', async (req, res) => {
+    try {
+        const tenant = await getActiveTenantBySlug(req.body?.tenantSlug);
+        if (!tenant) return res.status(404).json({ success: false, message: 'Workspace not found or inactive.' });
+        const customId = String(req.body?.customId || '').trim();
+        const password = String(req.body?.password || '');
+        return tenantContext.run(String(tenant.tenantId), async () => {
+            const user = await UserModel.findOne({ customId });
+            if (!user || !user.password || !(await verifyPassword(password, user.password)))
+                return res.status(401).json({ success: false, message: 'Invalid login ID or password.' });
+            return res.json({ success: true, token: issueTenantToken(user.telegramChatId, tenant.tenantId), user: { id: String(user._id), name: user.name, customId: user.customId, coins: user.jpwCoins || 0, tenant: tenant.slug } });
+        });
+    } catch (_) { return res.status(500).json({ success: false, message: 'Login failed.' }); }
+});
+app.get('/api/tenant/v1/me', requireTenantCustomer, async (req, res) => {
+    try {
+        const user = await UserModel.findOne({ telegramChatId: req.authChatId }).select('-password').lean();
+        if (!user) return res.status(404).json({ success: false, message: 'Customer not found.' });
+        return res.json({ success: true, user: { id: String(user._id), name: user.name, customId: user.customId, coins: user.jpwCoins || 0, activePackage: user.activePackage, tenant: req.tenant.slug } });
+    } catch (_) { return res.status(500).json({ success: false, message: 'Could not load customer profile.' }); }
+});
+app.get('/api/tenant/v1/orders', requireTenantCustomer, async (req, res) => {
+    try {
+        const orders = await OrderModel.find({ telegramChatId: req.authChatId }).sort({ createdAt: -1 }).limit(100).select('-targetPass').lean();
+        return res.json({ success: true, orders });
+    } catch (_) { return res.status(500).json({ success: false, message: 'Could not load orders.' }); }
+});
+app.get('/api/tenant/v1/payments', requireTenantCustomer, async (req, res) => {
+    try {
+        const payments = await PaymentModel.find({ telegramChatId: req.authChatId }).sort({ createdAt: -1 }).limit(100).select('-auditLog').lean();
+        return res.json({ success: true, payments });
+    } catch (_) { return res.status(500).json({ success: false, message: 'Could not load payments.' }); }
 });
 
 
@@ -1671,6 +2060,7 @@ app.get('/api/admin/gateway-replies', requireAdminAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 const CallCompleteModel = mongoose.model('CallCompleteService', callCompleteSchema);
+applyTenantIsolation(usedUtrSchema);
 const UsedUtrModel = mongoose.model('UsedUtr', usedUtrSchema);
 const AnnouncementModel = mongoose.model('Announcement', announcementSchema);
 const PaymentModel = mongoose.model('Payment', paymentSchema);
@@ -1733,7 +2123,7 @@ function tenantSlug(value) {
 // Phase 4: durable MongoDB-backed FIFO gateway queue.
 const gatewayQueueSchema = new mongoose.Schema({
     tenantId: { type: String, default: 'legacy', index: true },
-    orderId: { type: String, required: true, unique: true, index: true },
+    orderId: { type: String, required: true },
     targetId: { type: String, required: true }, targetPass: { type: String, required: true },
     gatewayConfig: { type: mongoose.Schema.Types.Mixed, default: {} },
     status: { type: String, enum: ['queued','processing','retry','sent','failed'], default: 'queued', index: true },
@@ -1745,7 +2135,9 @@ const gatewayQueueSchema = new mongoose.Schema({
     refundReviewRequired: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now, index: true }, startedAt: Date, completedAt: Date
 }, { versionKey: false });
-gatewayQueueSchema.index({ status: 1, nextRunAt: 1, createdAt: 1 });
+gatewayQueueSchema.index({ tenantId: 1, orderId: 1 }, { unique: true, name: 'tenant_queue_order_unique' });
+gatewayQueueSchema.index({ tenantId: 1, status: 1, nextRunAt: 1, createdAt: 1 });
+applyTenantIsolation(gatewayQueueSchema);
 const GatewayQueueModel = mongoose.models.GatewayQueue || mongoose.model('GatewayQueue', gatewayQueueSchema);
 const gatewayQueueLockSchema = new mongoose.Schema({ _id: String, owner: String, lockedUntil: Date }, { versionKey: false });
 const GatewayQueueLockModel = mongoose.models.GatewayQueueLock || mongoose.model('GatewayQueueLock', gatewayQueueLockSchema);
@@ -1821,6 +2213,17 @@ const wa = require('./whatsapp')({ mongoose, debugLog });
 // fixed amount for the whole day. Everything about them is managed from the Admin Panel > Selected tab only.
 // They use their own WhatsApp number (waSel) for reports and payment messages.
 const waSel = require('./whatsapp')({ mongoose, debugLog, name: 'sel', label: 'WhatsApp-Selected' });
+
+// Keep WhatsApp customer/admin messages aligned with the live white-label brand.
+const _waReplyOriginal = wa.reply.bind(wa);
+wa.reply = async (jid, message, ...args) => {
+    let brand='JPW';
+    try { brand=(await getPublicBranding()).siteName || brand; } catch(e) {}
+    const body=String(message ?? '');
+    const signature=`\n\n${brand} · Powered by TEKNA TECHNOLOGY`;
+    return _waReplyOriginal(jid, body.includes('Powered by TEKNA TECHNOLOGY') ? body : body+signature, ...args);
+};
+
 const selectedSchema = new mongoose.Schema({
     telegramChatId: { type: String, required: true, unique: true },
     customId: { type: String, default: '' },
@@ -2524,6 +2927,21 @@ async function waSubmitOrder({ from, jid, lang, targetId, targetPass }) {
 }
 
 wa.onMessage(async ({ from, jid, text, hasMedia, pushName }) => {
+    // The configured WhatsApp gateway/target number is a service endpoint, NOT a customer.
+    // Never send it the customer language picker, welcome/menu, balance, payment, or help replies.
+    // Its inbound replies are handled separately by handleExternalGatewayWhatsAppReply below.
+    try {
+        const gatewayCfgForInbound = await getGatewayRoutingConfig();
+        const inboundNumber = normalizeGatewayNumber(from || (jid || '').split('@')[0]);
+        const serviceTargetNumber = normalizeGatewayNumber(gatewayCfgForInbound && gatewayCfgForInbound.whatsappTarget);
+        if (serviceTargetNumber && inboundNumber && inboundNumber === serviceTargetNumber) {
+            debugLog('WhatsApp', 'Suppressed customer-bot flow for configured gateway target number; reply is reserved for order-result capture.');
+            return;
+        }
+    } catch (e) {
+        debugLog('WhatsApp', 'Could not verify gateway target number before customer flow:', e.message);
+    }
+
     const now = Date.now();
     if (now - (waLastReply.get(from) || 0) < 3000) return;
     waLastReply.set(from, now);
@@ -2613,14 +3031,26 @@ const RECONCILE_MIN_AGE_MS = 30 * 60 * 1000;       // newer ones are still being
 
 // same crediting rule as /api/verify-instant: the UsedUtr claim guarantees a payment is credited only ONCE, whoever gets there first
 async function creditPaymentRecord(pay) {
-    try { await UsedUtrModel.create({ utrId: pay.orderId }); }
-    catch (e) { if (e && e.code === 11000) return null; throw e; }
-    const user = await UserModel.findOneAndUpdate(
-        { telegramChatId: pay.telegramChatId },
-        { $inc: { jpwCoins: pay.coins }, $set: { lastPackageCoins: pay.coins, activePackage: `₹${pay.amount} (${pay.coins} Coins)`, packageExpiryTime: new Date(Date.now() + 28 * 24 * 60 * 60 * 1000) } },
-        { new: true }
-    );
-    if (!user) { await UsedUtrModel.deleteOne({ utrId: pay.orderId }).catch(() => {}); return null; }   // user not found: undo the claim
+    const tenantId = String(pay.tenantId || 'legacy');
+    const session = await mongoose.startSession();
+    let user = null;
+    try {
+        await session.withTransaction(async () => {
+            // The unique claim and wallet increment commit or roll back together.
+            await UsedUtrModel.create([{ tenantId, utrId: pay.orderId }], { session });
+            user = await UserModel.findOneAndUpdate(
+                { tenantId, telegramChatId: pay.telegramChatId },
+                { $inc: { jpwCoins: pay.coins }, $set: { lastPackageCoins: pay.coins, activePackage: `₹${pay.amount} (${pay.coins} Coins)`, packageExpiryTime: new Date(Date.now() + 28 * 24 * 60 * 60 * 1000) } },
+                { new: true, session }
+            );
+            if (!user) throw new Error('PAYMENT_CUSTOMER_NOT_FOUND');
+        });
+    } catch (e) {
+        if (e && (e.code === 11000 || e.message === 'PAYMENT_CUSTOMER_NOT_FOUND')) return null;
+        throw e;
+    } finally {
+        await session.endSession();
+    }
     sendLogToGoogleSheet({ logType: 'PAYMENT', actionType: 'AUTO_RECOVERED_PAYMENT', identifier: pay.telegramChatId, subDetails: `Name: ${user.name}`, amountOrCoins: `${pay.coins} Coins (₹${pay.amount})`, utrId: pay.orderId });
     return user;
 }
@@ -2629,9 +3059,10 @@ async function reconcilePayments(tag = 'run') {
     const result = { checked: 0, recovered: 0, notPaid: 0, lines: [] };
     if (mongoose.connection.readyState !== 1) return result;
     const from = new Date(Date.now() - RECONCILE_WINDOW_MS), to = new Date(Date.now() - RECONCILE_MIN_AGE_MS);
-    const recs = await PaymentModel.find({ createdAt: { $gte: from, $lte: to }, coins: { $gt: 0 } }).sort({ createdAt: 1 }).limit(300);
+    // This worker uses the single legacy gateway configuration. Tenant-specific billing is intentionally excluded.
+    const recs = await PaymentModel.find({ tenantId: 'legacy', createdAt: { $gte: from, $lte: to }, coins: { $gt: 0 } }).sort({ createdAt: 1 }).limit(300);
     if (!recs.length) { rlog(tag, { result: 'RUN', note: 'Check karne ke liye koi payment nahi mila (pichle 72 ghante).' }); return result; }
-    const done = new Set((await UsedUtrModel.find({ utrId: { $in: recs.map(r => r.orderId) } }).select('utrId').lean()).map(x => x.utrId));
+    const done = new Set((await UsedUtrModel.find({ tenantId: 'legacy', utrId: { $in: recs.map(r => r.orderId) } }).select('utrId').lean()).map(x => x.utrId));
     let gwCalls = 0;
     for (const pay of recs) {
         if (done.has(pay.orderId)) continue;                          // already credited
@@ -2879,6 +3310,34 @@ async function runBackup(reason) {
         }
         if (!sentTo.length) return { ok: false, message: 'Backup was built but could not be sent (no admin Telegram / WhatsApp reachable).' };
         await SettingModel.findOneAndUpdate({ key: 'lastBackupDay' }, { value: day, updatedAt: new Date() }, { upsert: true });
+
+        // Daily operational report (IST midnight run): summarize system state alongside the full encrypted backup.
+        try {
+            const [ordersToday, paymentsToday, usersTotal, pendingOrders, pendingPayments] = await Promise.all([
+                OrderModel.countDocuments({createdAt:{$gte:new Date(Date.now()-24*60*60*1000)}}),
+                PaymentModel.countDocuments({createdAt:{$gte:new Date(Date.now()-24*60*60*1000)}}),
+                UserModel.countDocuments({}),
+                OrderModel.countDocuments({status:{$in:['Pending','Accepted','In Progress']}}),
+                PaymentModel.countDocuments({status:'PENDING'})
+            ]);
+            let logTail = '';
+            try {
+                const fs = require('fs');
+                const logPath = getLogFilePath();
+                if (logPath && fs.existsSync(logPath)) logTail = fs.readFileSync(logPath,'utf8').slice(-6000);
+            } catch(e) {}
+            const report = `📊 ${BRANDING_ENV_DEFAULTS.siteName} — Daily Server Report\nDate (IST): ${day}\nUptime: ${Math.floor(process.uptime()/3600)}h ${Math.floor((process.uptime()%3600)/60)}m\nMemory RSS: ${(process.memoryUsage().rss/1048576).toFixed(1)} MB\nDatabase: ${mongoose.connection.readyState===1?'Connected':'Disconnected'}\nUsers total: ${usersTotal}\nOrders (last 24h): ${ordersToday}\nPayments (last 24h): ${paymentsToday}\nPending orders: ${pendingOrders}\nPending payments: ${pendingPayments}\nBackup: ${mb} MB / ${total} records\nBackup sent to: ${sentTo.join(', ')}\n\nRecent server log tail:\n${logTail.slice(-3500) || 'No log file available.'}`;
+            if (ADMIN_BOT_TOKEN && ADMIN_CHAT_ID) {
+                try { await new TelegramBot(ADMIN_BOT_TOKEN,{polling:false}).sendMessage(ADMIN_CHAT_ID,report.slice(0,3900)); }
+                catch(e){ debugLog('Backup','Telegram daily report send failed:',e.message); }
+            }
+            if (wa.isConnected()) {
+                for (const admin of await waGetAdmins()) {
+                    try { await wa.reply(admin.jid || `${admin.number}@s.whatsapp.net`, report.slice(0,3900)); }
+                    catch(e){ debugLog('Backup','WhatsApp daily report send failed:',e.message); }
+                }
+            }
+        } catch(reportError) { debugLog('Backup','Daily report generation failed:',reportError.message); }
         debugLog('Backup', `Sent ${mb} MB (${total} records) to ${sentTo.join(' + ')}`);
         return { ok: true, message: `Backup sent to ${sentTo.join(' + ')} (${total} records, ${mb} MB).`, summary };
     } catch (e) {
@@ -3550,7 +4009,7 @@ app.post('/api/external/v1/approve-payment', requireInternalAuth, async (req, re
         const finiteCoins = Number(coins);
         if (!Number.isSafeInteger(finiteCoins) || finiteCoins < 1 || finiteCoins > 100000)
             return res.status(400).json({ success: false, message: 'Only a finite whole-number Reach/Coin quantity is allowed.' });
-        let user = await UserModel.findOne({ telegramChatId: String(telegramChatId) });
+        let user = await UserModel.findOne({ tenantId: 'legacy', telegramChatId: String(telegramChatId) });
         if (!user) return res.json({ success: false, message: 'User not found' });
 
         // Daily Bonus coins do NOT count as an active plan — only unused package coins do
@@ -3582,7 +4041,7 @@ app.post('/api/external/v1/approve-payment', requireInternalAuth, async (req, re
 app.post('/api/external/v1/update-commission', requireInternalAuth, async (req, res) => {
     try {
         const { telegramChatId, amount, action } = req.body;
-        let user = await UserModel.findOne({ telegramChatId: String(telegramChatId) });
+        let user = await UserModel.findOne({ tenantId: 'legacy', telegramChatId: String(telegramChatId) });
         if (!user) return res.json({ success: false, message: 'User not found' });
 
         const amt = parseFloat(amount) || 0;
@@ -3857,7 +4316,7 @@ app.post('/api/register', async (req, res) => {
         if (!customId || !password) return res.json({ success: false, message: 'ID and password are required' });
         if (customId.length < 3 || customId.length > 30) return res.json({ success: false, message: 'ID must be 3-30 characters' });
         if (password.length < 4) return res.json({ success: false, message: 'Password must be at least 4 characters' });
-        if (await UserModel.findOne({ customId })) {
+        if (await UserModel.findOne({ tenantId: 'legacy', customId })) {
             return res.json({ success: false, message: 'ID already exists!' });
         }
         // 🔒 hash the password before storing it — never store plaintext passwords
@@ -3913,7 +4372,7 @@ app.post('/api/login', async (req, res) => {
         if (!customId || !password) return res.json({ success: false, message: 'ID and password are required' });
         const loginKey = `login|${req.ip}|${customId.toLowerCase()}`;
         if (isBlocked(loginKey, 10)) return res.status(429).json({ success: false, message: 'Too many wrong attempts. Try again in 15 minutes.' });
-        const user = await UserModel.findOne({ customId });
+        const user = await UserModel.findOne({ tenantId: 'legacy', customId });
         let ok = false;
         if (user && user.password) {
             const result = await verifyPassword(password, user.password);
@@ -3941,7 +4400,7 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/auth/check-user-type', async (req, res) => {
     try {
         const { identifier } = req.body;
-        const user = await UserModel.findOne({ $or: [{ customId: identifier }, { telegramChatId: identifier }] });
+        const user = await UserModel.findOne({ tenantId: 'legacy', $or: [{ customId: identifier }, { telegramChatId: identifier }] });
         if(user) {
             res.json({ success: true, telegramChatId: user.telegramChatId, authType: user.password ? 'PASSWORD' : 'OTP' });
         } else {
@@ -4100,6 +4559,35 @@ app.post('/api/pay', requireUser, async (req, res) => {
         const returnPath = req.body.source === 'app' ? '/app' : '/';
         const mySuccessUrl = `${publicBase(req)}${returnPath}?payment=success&telegramChatId=${encodeURIComponent(telegramChatId)}&coins=${validPackage.coins}&order_id=${orderId}`;
 
+
+        const methodsConfig = await getPaymentMethodsConfig();
+        const selectedMethod = String(req.body.paymentMethod || 'teknapay').toLowerCase();
+        if (!['teknapay','builtin','manual'].includes(selectedMethod) || methodsConfig.enabled[selectedMethod] !== true) {
+            await PaymentModel.updateOne({ orderId }, { $set: { status: 'FAILED' } });
+            return res.status(400).json({ success:false, message:'Selected payment method is unavailable.' });
+        }
+        await PaymentModel.updateOne({ orderId }, { $set: { paymentMethod: selectedMethod } });
+        if (selectedMethod === 'builtin' || selectedMethod === 'manual') {
+            const methodCfg = methodsConfig[selectedMethod];
+            const reference = `JPW-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+            await PaymentModel.updateOne({ orderId }, { $set: {
+                paymentMethod:selectedMethod, merchantReference:reference, status:'PENDING'
+            }});
+            if (selectedMethod === 'builtin') {
+                const branding = await getPublicBranding();
+                const customerBrandName = branding.siteName || 'Website';
+                const upiUrl = `upi://pay?${new URLSearchParams({pa:methodCfg.upiId,pn:methodCfg.merchantName || customerBrandName,am:Number(validPackage.amount).toFixed(2),cu:'INR',tn:reference}).toString()}`;
+                const QRCodeLib = require('qrcode');
+                const qrSvg = await QRCodeLib.toString(upiUrl,{type:'svg',errorCorrectionLevel:'M',margin:2,width:360});
+                const safeTitle = customerBrandName.replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+                const safeRef = reference.replace(/[&<>"']/g,'');
+                const qrCardSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="640" viewBox="0 0 480 640"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1024"/><stop offset=".55" stop-color="#24134b"/><stop offset="1" stop-color="#4c1d75"/></linearGradient><linearGradient id="gold" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#f5d78e"/><stop offset="1" stop-color="#d6a84f"/></linearGradient></defs><rect width="480" height="640" rx="34" fill="url(#bg)"/><rect x="13" y="13" width="454" height="614" rx="26" fill="none" stroke="url(#gold)" stroke-opacity=".7" stroke-width="2"/><circle cx="40" cy="40" r="3" fill="#f5d78e"/><circle cx="440" cy="40" r="3" fill="#f5d78e"/><text x="240" y="61" text-anchor="middle" font-family="Arial,sans-serif" font-size="27" font-weight="700" fill="#fff">${safeTitle}</text><text x="240" y="89" text-anchor="middle" font-family="Arial,sans-serif" font-size="12" letter-spacing="2" fill="#d8c8ff">SECURE UPI PAYMENT</text><rect x="60" y="112" width="360" height="360" rx="22" fill="#fff"/><g transform="translate(80 132)">${qrSvg.replace(/^<\?xml[^>]*\?>/,'').replace(/<svg[^>]*>/,'').replace('</svg>','')}</g><text x="240" y="516" text-anchor="middle" font-family="Arial,sans-serif" font-size="15" fill="#d8c8ff">AMOUNT TO PAY</text><text x="240" y="555" text-anchor="middle" font-family="Arial,sans-serif" font-size="34" font-weight="700" fill="#fff">₹${Number(validPackage.amount).toFixed(2)}</text><rect x="74" y="574" width="332" height="1" fill="#b99be8" opacity=".5"/><text x="240" y="598" text-anchor="middle" font-family="Arial,sans-serif" font-size="13" font-weight="700" fill="#f5d78e">${safeRef}</text><text x="240" y="622" text-anchor="middle" font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#fff">Generated by TEKNA TECHNOLOGY</text></svg>`;
+                const qrDataUrl = 'data:image/svg+xml;base64,' + Buffer.from(qrCardSvg).toString('base64');
+                return res.json({success:true,paymentMethod:'builtin',orderId,reference,amount:validPackage.amount,coins:validPackage.coins,upiId:methodCfg.upiId,upiUrl,qrDataUrl,brandName:customerBrandName,generatedBy:'TEKNA TECHNOLOGY',message:'Payment remains pending until verified.'});
+            }
+            return res.json({success:true,paymentMethod:'manual',orderId,reference,amount:validPackage.amount,coins:validPackage.coins,upiId:methodCfg.upiId,accountName:methodCfg.accountName,instructions:methodCfg.instructions,brandName:(await getPublicBranding()).siteName,generatedBy:'TEKNA TECHNOLOGY',message:'Submit payment reference for admin verification.'});
+        }
+
         const pgResponse = await fetch(PRIVATE_PG_URL, {
             method: 'POST',
             headers: {
@@ -4126,37 +4614,100 @@ app.post('/api/pay', requireUser, async (req, res) => {
     }
 });
 
+
+// Customer submits a bank/UPI reference for manual review. This never credits balance by itself.
+app.post('/api/payment/submit-reference', requireUser, async (req,res) => {
+    try {
+        const orderId=String(req.body?.orderId||'').trim();
+        const utr=String(req.body?.utr||'').trim().replace(/\s+/g,'');
+        const normalizedUtr=utr.toUpperCase();
+        const note=String(req.body?.note||'').trim().slice(0,300);
+        if(!orderId || !/^[A-Za-z0-9-]{6,40}$/.test(utr)) return res.status(400).json({success:false,message:'Enter a valid UTR / transaction reference (6–40 letters or numbers).'});
+        const payment=await PaymentModel.findOne({tenantId:'legacy',orderId,telegramChatId:String(req.authChatId||'')});
+        if(!payment) return res.status(404).json({success:false,message:'Payment request not found.'});
+        if(payment.status!=='PENDING') return res.status(409).json({success:false,message:'This payment is no longer pending.'});
+        const duplicate=await PaymentModel.findOne({tenantId:'legacy',normalizedUtr,status:{$in:['PENDING','SUCCESS']}});
+        if(duplicate && String(duplicate._id)!==String(payment._id)) return res.status(409).json({success:false,message:'This transaction reference has already been submitted.'});
+        payment.utr=utr; payment.normalizedUtr=normalizedUtr; payment.customerNote=note;
+        payment.auditLog=(payment.auditLog||[]).concat([{action:'CUSTOMER_REFERENCE_SUBMITTED',at:new Date(),reference:utr}]);
+        await payment.save();
+        res.json({success:true,message:'Reference received. Your payment will remain pending until the admin verifies it.'});
+    } catch(e){ if (e && e.code === 11000) return res.status(409).json({success:false,message:'This transaction reference has already been submitted.'}); res.status(500).json({success:false,message:'Could not submit payment reference.'});}
+});
+app.get('/api/admin/payment-reviews', requireAdminAuth, async (req,res)=>{
+    try{
+        const status=String(req.query.status||'PENDING').toUpperCase();
+        const filter=['PENDING','SUCCESS','FAILED'].includes(status)?{status}:{};
+        const items=await PaymentModel.find(filter).sort({createdAt:-1}).limit(250).lean();
+        res.set('Cache-Control','no-store');
+        res.json({success:true,payments:items.map(p=>({orderId:p.orderId,amount:p.amount,coins:p.coins,telegramChatId:p.telegramChatId,status:p.status,paymentMethod:p.paymentMethod||'teknapay',merchantReference:p.merchantReference||'',utr:p.utr||'',customerNote:p.customerNote||'',createdAt:p.createdAt,reviewedAt:p.reviewedAt,auditLog:p.auditLog||[]}))});
+    }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+app.post('/api/admin/payment-reviews/action', requireAdminAuth, async (req,res)=>{
+    try{
+        const orderId=String(req.body?.orderId||'').trim();
+        const action=String(req.body?.action||'').toLowerCase();
+        const reason=String(req.body?.reason||'').trim().slice(0,300);
+        if(!orderId || !['approve','reject'].includes(action)) return res.status(400).json({success:false,message:'Invalid payment review action.'});
+        const payment=await PaymentModel.findOne({orderId});
+        if(!payment) return res.status(404).json({success:false,message:'Payment not found.'});
+        if(payment.status!=='PENDING') return res.status(409).json({success:false,message:'Only pending payments can be reviewed.'});
+        if(action==='approve'){
+            // Admin confirmation is explicit; UTR is required for non-gateway methods.
+            if(payment.paymentMethod!=='teknapay' && !payment.utr) return res.status(400).json({success:false,message:'A customer UTR/reference is required before approval.'});
+            payment.status='SUCCESS';
+            // Customer's existing /api/verify-instant flow performs the canonical balance + ledger credit.
+        }else{
+            payment.status='FAILED';
+        }
+        payment.reviewedBy=String(req.admin?.username||req.user?.username||'admin').slice(0,80);
+        payment.reviewedAt=new Date();
+        payment.auditLog=(payment.auditLog||[]).concat([{action:action==='approve'?'ADMIN_APPROVED':'ADMIN_REJECTED',at:new Date(),by:payment.reviewedBy,reason}]);
+        await payment.save();
+        res.json({success:true,message:action==='approve'?'Payment approved. Verify the customer balance and ledger.':'Payment rejected.'});
+    }catch(e){res.status(500).json({success:false,message:e.message});}
+});
+
 // 🔒 NEW: Payment gateway webhook — this is the only place that should ever
 // flip a PaymentModel record from PENDING to SUCCESS. The private payment gateway
 // must be configured to call this URL (server-to-server) when a payment completes.
 // Protect it with the same PRIVATE_API_KEY used when creating the payment.
 app.post('/api/payment-webhook', async (req, res) => {
     try {
-        const providedKey = req.headers['x-api-key'];
-        if (!providedKey || providedKey !== PRIVATE_API_KEY) {
+        const providedKey = String(req.headers['x-api-key'] || '');
+        if (!PRIVATE_API_KEY || !providedKey || !safeEqual(providedKey, PRIVATE_API_KEY))
             return res.status(401).json({ success: false, message: 'Unauthorized webhook call' });
+        // Optional HMAC verification is strongly recommended for gateways that support it.
+        if (process.env.PRIVATE_WEBHOOK_SECRET) {
+            const signature = String(req.headers['x-webhook-signature'] || '').replace(/^sha256=/i, '').toLowerCase();
+            const expected = crypto.createHmac('sha256', process.env.PRIVATE_WEBHOOK_SECRET).update(req.rawBody || Buffer.from('')).digest('hex');
+            if (!signature || !safeEqual(signature, expected)) return res.status(401).json({ success: false, message: 'Invalid webhook signature' });
         }
-
-        const { orderId, status } = req.body;
-        if (!orderId || !status) return res.status(400).json({ success: false, message: 'orderId and status are required' });
-
-        const paymentRecord = await PaymentModel.findOne({ orderId });
+        const orderId = String(req.body?.orderId || req.body?.order_id || '').trim();
+        const status = String(req.body?.status || '').toUpperCase();
+        const amount = Number(req.body?.amount);
+        if (!orderId || !['SUCCESS','FAILED','PENDING'].includes(status) || !Number.isFinite(amount))
+            return res.status(400).json({ success: false, message: 'orderId, valid status and amount are required' });
+        const paymentRecord = await PaymentModel.findOne({ tenantId: 'legacy', orderId });
         if (!paymentRecord) return res.status(404).json({ success: false, message: 'Order not found' });
-
-        paymentRecord.status = status === 'SUCCESS' ? 'SUCCESS' : 'FAILED';
+        if (paymentRecord.paymentMethod !== 'teknapay') return res.status(403).json({ success: false, message: 'Webhook cannot approve this payment method.' });
+        if (Number(paymentRecord.amount) !== amount) return res.status(409).json({ success: false, message: 'Payment amount mismatch' });
+        // Never downgrade a confirmed payment. Refund/reversal must be a separate audited event.
+        if (paymentRecord.status === 'SUCCESS') return res.json({ success: true, status: 'SUCCESS', unchanged: true });
+        if (status === 'SUCCESS') paymentRecord.status = 'SUCCESS';
+        else if (status === 'FAILED' && paymentRecord.status === 'PENDING') paymentRecord.status = 'FAILED';
         await paymentRecord.save();
-
-        res.json({ success: true, message: 'Webhook processed' });
+        res.json({ success: true, status: paymentRecord.status, message: 'Webhook processed' });
     } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+        res.status(500).json({ success: false, message: 'Webhook processing failed' });
     }
 });
 
-app.get('/api/verify-db-status/:orderId', async (req, res) => {
+app.get('/api/verify-db-status/:orderId', requireUser, async (req, res) => {
     const { orderId } = req.params;
     
     try {
-        const paymentRecord = await PaymentModel.findOne({ orderId: orderId });
+        const paymentRecord = await PaymentModel.findOne({ tenantId: 'legacy', orderId: orderId, telegramChatId: String(req.authChatId || req.body?.telegramChatId || '') });
         
         if (!paymentRecord) {
             return res.status(404).json({
@@ -4200,7 +4751,7 @@ async function checkGatewayPaymentStatus(orderId) {
         const base = new URL(PRIVATE_PG_URL).origin;
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 15000);
-        const r = await fetch(`${base}/api/check-status/${encodeURIComponent(orderId)}`, { signal: ctrl.signal });
+        const r = await fetch(`${base}/api/check-status/${encodeURIComponent(orderId)}`, { signal: ctrl.signal, headers: PRIVATE_API_KEY ? { 'x-api-key': PRIVATE_API_KEY } : {} });
         clearTimeout(timer);
         const d = await r.json();
         return d && d.success ? { status: d.status, amount: Number(d.amount) } : null;
@@ -4210,27 +4761,28 @@ async function checkGatewayPaymentStatus(orderId) {
     }
 }
 
-app.post('/api/verify-instant', async (req, res) => {
+app.post('/api/verify-instant', requireUser, async (req, res) => {
     try {
-        const { telegramChatId, order_id } = req.body;
-        let user = await UserModel.findOne({ telegramChatId: String(telegramChatId) });
+        const internalCall = !!(req.headers['x-internal-secret'] && INTERNAL_API_SECRET && safeEqual(req.headers['x-internal-secret'], INTERNAL_API_SECRET));
+        const telegramChatId = internalCall ? String(req.body?.telegramChatId || '') : String(req.authChatId || '');
+        const order_id = req.body?.order_id;
+        let user = await UserModel.findOne({ tenantId: 'legacy', telegramChatId: String(telegramChatId) });
         if (!user) return res.json({ success: false, message: 'User not found' });
 
         if (!order_id) return res.json({ success: false, message: 'Order ID required' });
         const transactionId = order_id;
 
-        const existingUtr = await UsedUtrModel.findOne({ utrId: transactionId });
-        if (existingUtr) return res.json({ success: false, message: 'Already credited' });
-
         // 🔒 SECURITY FIX: never trust coins from the client — only credit coins that were
         // recorded server-side when the payment was created, and only if the gateway/db
         // actually marked the payment record as SUCCESS.
-        const paymentRecord = await PaymentModel.findOne({ orderId: transactionId, telegramChatId: String(telegramChatId) });
+        const paymentRecord = await PaymentModel.findOne({ tenantId: 'legacy', orderId: transactionId, telegramChatId: String(telegramChatId) });
         if (!paymentRecord) return res.json({ success: false, message: 'Payment record not found' });
+        const existingUtr = await UsedUtrModel.findOne({ tenantId: paymentRecord.tenantId || 'legacy', utrId: transactionId });
+        if (existingUtr) return res.json({ success: false, message: 'Already credited' });
         if (paymentRecord.status !== 'SUCCESS') {
             // Webhook may have been missed: ask the gateway itself before giving up
             const gw = await checkGatewayPaymentStatus(transactionId);
-            if (gw && gw.status === 'SUCCESS' && gw.amount === Number(paymentRecord.amount)) {
+            if (gw && String(gw.status).toUpperCase() === 'SUCCESS' && Number(gw.amount) === Number(paymentRecord.amount)) {
                 paymentRecord.status = 'SUCCESS';
                 await paymentRecord.save();
                 debugLog('Payment', `Order ${transactionId} confirmed via gateway status check (webhook was missing).`);
@@ -4244,15 +4796,8 @@ app.post('/api/verify-instant', async (req, res) => {
             return res.json({ success: false, message: 'Invalid payment record' });
         }
 
-        const expiryDate = new Date(Date.now() + 28 * 24 * 60 * 60 * 1000);
-        // claim the order first: a second parallel call hits the unique index and stops here (no double credit, no 500)
-        try { await UsedUtrModel.create({ utrId: transactionId }); }
-        catch (e) { if (e && e.code === 11000) return res.json({ success: false, message: 'Already credited' }); throw e; }
-        user = await UserModel.findOneAndUpdate(
-            { telegramChatId: String(telegramChatId) },
-            { $inc: { jpwCoins: coinsToCredit }, $set: { lastPackageCoins: coinsToCredit, packageExpiryTime: expiryDate } },
-            { new: true }
-        );
+        user = await creditPaymentRecord(paymentRecord);
+        if (!user) return res.json({ success: false, message: 'Already credited or customer record unavailable.' });
 
         sendLogToGoogleSheet({
             logType: 'PAYMENT',
@@ -4344,7 +4889,7 @@ async function dispatchOrderToConfiguredGateway(targetId, targetPass, orderId = 
         if (!orderId) throw new Error('A saved order ID is required for queued gateway dispatch.');
         const queued = await GatewayQueueModel.findOneAndUpdate(
             { orderId: String(orderId) },
-            { $setOnInsert: { orderId: String(orderId), targetId: String(targetId), targetPass: String(targetPass),
+            { $setOnInsert: { orderId: String(orderId), targetId: String(targetId), targetPass: encryptSensitive(targetPass),
                 gatewayConfig: { ...cfg }, status: 'queued', attempts: 0, maxAttempts: 4, nextRunAt: new Date(), createdAt: new Date() } },
             { upsert: true, new: true, setDefaultsOnInsert: true }
         );
@@ -4393,6 +4938,7 @@ let gatewayQueueTimer = null;
 let gatewayQueueBusy = false;
 const GATEWAY_QUEUE_RETRY_MS = [10000, 30000, 90000];
 async function processOneGatewayQueueJob() {
+    if (global.__JPW_LICENSE_ACTIVE !== true) return;
     if (gatewayQueueBusy || mongoose.connection.readyState !== 1) return;
     gatewayQueueBusy = true;
     let job = null;
@@ -4422,7 +4968,7 @@ async function processOneGatewayQueueJob() {
         if (job.attempts === 1) job.startedAt = new Date();
         await job.save();
         const snapshot = { ...(job.gatewayConfig || {}), dispatch: 'direct' };
-        const result = await dispatchOrderToConfiguredGateway(job.targetId, job.targetPass, job.orderId, true, snapshot);
+        const result = await dispatchOrderToConfiguredGateway(job.targetId, decryptSensitive(job.targetPass), job.orderId, true, snapshot);
         if (!result || !result.success) throw new Error('All configured gateway routes failed.');
         job.status = 'sent'; job.result = result.results || {}; job.lastError = '';
         job.completedAt = new Date(); job.lockedUntil = null; job.workerId = '';
@@ -4485,33 +5031,43 @@ function classifyGatewayReply(text) {
     if (/\b(security check|processing|queued|in progress|starting reach|working on reach|verifying)\b/.test(t)) return 'in_progress';
     return 'unclassified';
 }
-function evaluateGatewayReplyRules(text, config) {
+function evaluateGatewayReplyRules(text, config, channel = 'whatsapp') {
     const raw = String(text || '').trim();
     const lower = raw.toLowerCase();
     const rules = config && config.enabled && Array.isArray(config.rules) ? config.rules : [];
     for (const rule of rules) {
         if (!rule || rule.enabled === false || !rule.keyword) continue;
-        const keyword = String(rule.keyword).trim().toLowerCase();
-        const matched = rule.matchMode === 'exact' ? lower === keyword : lower.includes(keyword);
+        if (rule.channel && rule.channel !== 'both' && rule.channel !== channel) continue;
+        const keyword = String(rule.keyword).trim();
+        let matched = false;
+        try {
+            if (rule.matchMode === 'exact') matched = lower === keyword.toLowerCase();
+            else if (rule.matchMode === 'regex') matched = new RegExp(keyword, 'i').test(raw);
+            else matched = lower.includes(keyword.toLowerCase());
+        } catch (_) { matched = false; }
         if (!matched) continue;
         let extracted = '';
         if (rule.extractPattern) {
-            try {
-                const m = raw.match(new RegExp(rule.extractPattern, 'i'));
-                if (m) extracted = String(m[1] || m[0] || '').slice(0, 120);
-            } catch (_) {}
+            try { const m = raw.match(new RegExp(rule.extractPattern, 'i')); if (m) extracted = String(m[1] || m[0] || '').slice(0, 120); } catch (_) {}
         }
-        return { classification: rule.classification || 'unclassified', ruleId: rule.id || '',
-            extracted, extractLabel: rule.extractLabel || '', customerMessage: rule.customerMessage || '' };
+        return { matched: true, classification: rule.classification || 'unclassified', ruleId: rule.id || '',
+            extracted, extractLabel: rule.extractLabel || '', customerMessage: rule.customerMessage || '', approxTime: Number(rule.approxTime || 0) };
     }
-    return { classification: classifyGatewayReply(raw), ruleId: '', extracted: '', extractLabel: '', customerMessage: '' };
+    return { matched: false, classification: classifyGatewayReply(raw), ruleId: '', extracted: '', extractLabel: '', customerMessage: '', approxTime: 0 };
+}
+function renderGatewayCustomerTemplate(template, order, evaluation) {
+    const source = String(template || '');
+    const hasTimeToken = /\{approxTime\}/i.test(source);
+    let rendered = source.replace(/\{targetId\}/g, String(order.targetId || ''))
+        .replace(/\{status\}/g, String(evaluation.classification || 'update'))
+        .replace(/\{extracted\}/g, String(evaluation.extracted || ''))
+        .replace(/\{approxTime\}/g, evaluation.approxTime ? `${evaluation.approxTime} minutes` : '');
+    if (evaluation.approxTime > 0 && !hasTimeToken) rendered += `\nApprox. time: ${evaluation.approxTime} minutes`;
+    return rendered.slice(0, 900);
 }
 async function sendGatewayCustomerNotice(order, evaluation, config) {
     if (!config || config.notifyCustomer !== true || !evaluation.customerMessage || !order.telegramChatId || !CUSTOMER_BOT_TOKEN) return false;
-    const message = String(evaluation.customerMessage)
-        .replace(/\\{targetId\\}/g, String(order.targetId || ''))
-        .replace(/\\{status\\}/g, String(evaluation.classification || 'update'))
-        .replace(/\\{extracted\\}/g, String(evaluation.extracted || '')).slice(0, 900);
+    const message = renderGatewayCustomerTemplate(evaluation.customerMessage, order, evaluation);
     if (!message.trim()) return false;
     try {
         const bot = new TelegramBot(CUSTOMER_BOT_TOKEN, { polling: false });
@@ -4562,7 +5118,7 @@ async function handleExternalGatewayWhatsAppReply({ from, jid, text, raw }) {
     if (msgId && Array.isArray(order.gatewayReplies) && order.gatewayReplies.some(r => r && r.messageId === msgId)) return;
 
     const replyRulesConfig = await getGatewayReplyRules();
-    const evaluation = evaluateGatewayReplyRules(rawText, replyRulesConfig);
+    const evaluation = evaluateGatewayReplyRules(rawText, replyRulesConfig, 'whatsapp');
     const replyRecord = {
         messageId: msgId, from: incomingNumber, receivedAt: new Date(), matchedBy,
         classification: evaluation.classification, ruleId: evaluation.ruleId,
@@ -4613,7 +5169,7 @@ async function placeOrder({ telegramChatId, targetId, targetPass, isPriority }) 
         if (!user) return { success: false, message: 'Insufficient Coins!' };
 
         const routeConfig = await getGatewayRoutingConfig();
-        const newOrder = await OrderModel.create({ telegramChatId: String(telegramChatId), targetId: cleanId, targetPass: cleanPass, isPriority: !!isPriority, gatewayMode: routeConfig.mode || 'telegram', gatewayDispatch: routeConfig.dispatch || 'direct' });
+        const newOrder = await OrderModel.create({ telegramChatId: String(telegramChatId), targetId: cleanId, targetPass: encryptSensitive(cleanPass), isPriority: !!isPriority, gatewayMode: routeConfig.mode || 'telegram', gatewayDispatch: routeConfig.dispatch || 'direct' });
         await notifyAdminAndUser(newOrder, `🌐 **New Reach Order**\n🆔 ID: \`${newOrder._id}\`\n🎯 Target: \`${cleanId}\``);
 
         sendLogToGoogleSheet({
@@ -4886,7 +5442,7 @@ app.post('/api/admin/tg-login/logout', requireAdminAuth, async (req, res) => {
 
 app.get('*', (req, res) => { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
 
-app.listen(PORT, '0.0.0.0', () => {
+httpServer = app.listen(PORT, '0.0.0.0', () => {
     debugLog('Server', `🚀 Portal live on port ${PORT}`);
     startKeepAlive({ port: PORT, path: '/health', log: debugLog });
 });

@@ -33,3 +33,19 @@ The source archive's `.env` was excluded from this output because it may contain
 
 ## Validation status
 The ZIP structure and HTML asset references were checked. This is not a live-server test; actual browser, authentication, payment, Telegram and WhatsApp behavior can only be confirmed on your hosting environment. No software change can honestly guarantee zero production risk, so take the backup and keep rollback ready.
+
+---
+
+## v2.16.1 Security Upgrade — additional deployment steps
+
+Before deploying v2.16.1, take a verified MongoDB backup. Configure `CORS_ORIGINS` and a stable `DATA_ENCRYPTION_KEY` in Render Environment. If supported by the payment provider, configure `PRIVATE_WEBHOOK_SECRET` and update the provider to send the HMAC signature header.
+
+Run the v2.16.1 database migration against a staging clone first:
+
+```bash
+npm run migrate:v2.16.1
+```
+
+The migration modifies unique indexes and encrypts existing target credentials. Do not run it against production without a restorable backup. After staging validation, run the same migration against production during a maintenance window, then deploy the matching v2.16.1 commit. Keep the encryption key unchanged across deploys and restores.
+
+Tenant API routes currently cover customer registration/login and tenant-scoped profile/order/payment-history reads only. Existing UI and operational payment/gateway workflows remain legacy-only; do not sell or activate full SaaS tenant processing from this release.

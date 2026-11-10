@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>JPW License Activation | TAKNA TECHNOLOGY</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;background:radial-gradient(circle at 15% 10%,#1e3a5f 0,transparent 38%),linear-gradient(145deg,#080d18,#111827 55%,#15102b);font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;color:#e5e7eb}.card{width:min(100%,520px);padding:30px;border:1px solid #334155;border-radius:24px;background:rgba(15,23,42,.94);box-shadow:0 24px 80px #0008}.brand{font-size:12px;letter-spacing:.18em;color:#93c5fd;font-weight:800}.mark{width:54px;height:54px;display:grid;place-items:center;border-radius:16px;background:#1d4ed8;color:white;font-size:25px;margin:22px 0 18px}h1{font-size:25px;margin:0 0 8px}p{color:#9ca3af;line-height:1.6;font-size:14px}.meta{padding:12px 14px;border:1px solid #263449;border-radius:12px;background:#0b1220;margin:18px 0;font-size:13px}.meta b{color:#cbd5e1}.field{display:block;margin:16px 0 7px;font-size:13px;color:#cbd5e1}input{width:100%;padding:14px;border:1px solid #475569;border-radius:11px;background:#080f1d;color:#fff;font-size:15px;outline:none}input:focus{border-color:#60a5fa;box-shadow:0 0 0 3px #2563eb33}button{width:100%;border:0;border-radius:11px;padding:14px;margin-top:18px;background:linear-gradient(90deg,#2563eb,#4f46e5);color:#fff;font-size:15px;font-weight:750;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.status{min-height:22px;margin-top:14px;font-size:13px}.error{color:#fca5a5}.ok{color:#86efac}.foot{margin-top:22px;padding-top:16px;border-top:1px solid #263449;color:#64748b;font-size:11px;text-align:center}a{color:#93c5fd}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="brand">TAKNA TECHNOLOGY</div>
+  <div class="mark">🔐</div>
+  <h1>Activate JPW License</h1>
+  <p>This installation requires a valid JPW product license. Enter the license key supplied by your software provider. Activation is verified securely with the central TAKNA license portal.</p>
+  <div class="meta"><div><b>Product:</b> JPW</div><div style="margin-top:6px"><b>Installation domain:</b> <span id="domain">Loading…</span></div><div style="margin-top:6px"><b>License status:</b> <span id="current">Checking…</span></div></div>
+  <form id="form">
+    <label class="field" for="owner">Customer / Company (optional)</label>
+    <input id="owner" name="owner" maxlength="160" autocomplete="organization" placeholder="Your company name">
+    <label class="field" for="key">License Key</label>
+    <input id="key" name="licenseKey" required minlength="12" maxlength="200" autocomplete="off" placeholder="Enter your JPW license key">
+    <button id="submit" type="submit">Activate License</button>
+  </form>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <div class="foot">License validation is server-side. Never share your license key or server credentials.<br>TAKNA TECHNOLOGY · JPW</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+$('domain').textContent=location.hostname;
+async function refresh(){try{const r=await fetch('/api/license/status',{cache:'no-store'});const d=await r.json();$('current').textContent=d.status||'UNKNOWN';if(d.active){$('status').textContent='License is active. Reloading…';$('status').className='status ok';setTimeout(()=>location.replace('/'),700)}}catch(_){$('current').textContent='Unable to check'}}
+refresh();
+$('form').addEventListener('submit',async e=>{
+ e.preventDefault();const btn=$('submit');btn.disabled=true;btn.textContent='Verifying…';$('status').textContent='Contacting central license server…';$('status').className='status';
+ try{const r=await fetch('/api/license/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({licenseKey:$('key').value.trim(),owner:$('owner').value.trim()})});const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Activation failed.');$('status').textContent='License activated successfully. Opening JPW…';$('status').className='status ok';setTimeout(()=>location.replace('/'),800)}
+ catch(err){$('status').textContent=err.message||'Activation failed.';$('status').className='status error'}
+ finally{btn.disabled=false;btn.textContent='Activate License'}
+});
+</script>
+</body></html>

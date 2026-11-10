@@ -173,12 +173,14 @@
 
         <div id="offers-section"></div>
         <h3 style="margin-top:22px; color: #e8eefc; font-size: 14px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 8px; text-align: left;">Packages</h3>
+        <label for="payment-method-choice" style="display:block;text-align:left;color:#cbd5e1;font-size:12px;margin:10px 0 6px;">Choose payment method</label>
+        <select id="payment-method-choice" style="width:100%;padding:12px;border-radius:12px;background:#111827;color:#f8fafc;border:1px solid #475569;margin-bottom:12px;"><option value="teknapay">TEKNAPAY – Secure Gateway</option></select>
         <div id="packages-list"></div>
     </div>
 
     <!-- Footer -->
     <div style="text-align: center; margin-top: 22px; font-size: 10px; color: #64748b; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 12px;">
-        <p>© 2026 JPW Reached Services. All rights reserved.</p>
+        <p>© 2026 TEKNA TECHNOLOGY. All Rights Reserved. · <a href="https://tikna.online" target="_blank" rel="noopener" style="color:#c4b5fd;text-decoration:none">tikna.online</a></p>
     </div>
 </div>
 
@@ -541,6 +543,7 @@
     }
 
     async function loadPackages() {
+        loadCustomerPaymentMethods();
         const res = await fetch('/api/packages');
         const data = await res.json();
         let html = '';
@@ -562,19 +565,55 @@
         pkgSection.scrollIntoView({ behavior: 'smooth' });
     }
 
-    // 💳 Updated buyPkg function to support Private Gateway redirect
+    async function loadCustomerPaymentMethods() {
+        try {
+            const r=await fetch('/api/public/payment-methods',{cache:'no-store'}), d=await r.json();
+            const sel=document.getElementById('payment-method-choice');
+            if(!sel || !d.success) return;
+            const labels={teknapay:'TEKNAPAY – Secure Gateway',builtin:'Built-in UPI – QR Payment',manual:'Manual UPI / Bank Transfer'};
+            sel.innerHTML='';
+            Object.keys(labels).forEach(k=>{
+                if(d.methods.enabled[k] && (k==='teknapay' || (k==='builtin'&&d.methods.builtin.configured) || (k==='manual'&&d.methods.manual.configured))){
+                    const o=document.createElement('option');o.value=k;o.textContent=labels[k];sel.appendChild(o);
+                }
+            });
+            if(!sel.options.length){const o=document.createElement('option');o.value='teknapay';o.textContent='Payment methods are being configured';sel.appendChild(o);}
+        }catch(e){console.warn('Payment methods unavailable',e);}
+    }
+
+    function showAlternativePayment(data) {
+        let body='';
+        if(data.paymentMethod==='builtin'){
+            body=`<div style="text-align:center"><div style="font-size:18px;font-weight:800;color:#f8fafc;margin-bottom:8px">${data.brandName||'Payment'}</div><img alt="UPI payment QR" src="${data.qrDataUrl}" style="width:min(100%,360px);border-radius:18px;border:1px solid #c4b5fd;background:#fff"><p style="color:#cbd5e1">Scan using any UPI app. Amount: <b>₹${Number(data.amount).toFixed(2)}</b></p></div>`;
+        }else{
+            body=`<div style="background:#1e1b4b;padding:16px;border-radius:14px;color:#f8fafc"><div>UPI ID: <b>${data.upiId||'Not configured'}</b></div><div>Account: <b>${data.accountName||'—'}</b></div><p>${data.instructions||''}</p><h3>Amount: ₹${Number(data.amount).toFixed(2)}</h3></div>`;
+        }
+        body+=`<p style="color:#cbd5e1;font-size:12px">Transaction Reference: <b>${data.reference}</b><br>Order: ${data.orderId}<br>Status: PENDING – payment is not credited until verified.</p>
+        <label style="display:block;color:#e2e8f0;margin:10px 0 5px">UPI UTR / Transaction ID</label><input id="payment-utr-input" placeholder="Enter 6–40 character UTR" style="width:100%;padding:12px;border-radius:10px;background:#0f172a;color:#fff;border:1px solid #64748b">
+        <button onclick="submitPaymentReference('${data.orderId}')" style="width:100%;padding:12px;margin-top:10px;border:0;border-radius:10px;background:linear-gradient(90deg,#7c3aed,#4f46e5);color:white;font-weight:700">Submit for Verification</button>`;
+        document.getElementById('modalTitle').innerText='Secure Payment';
+        document.getElementById('modalBody').innerHTML=body;
+        document.getElementById('infoModal').classList.remove('hidden');
+    }
+
+    async function submitPaymentReference(orderId){
+        const utr=document.getElementById('payment-utr-input')?.value?.trim()||'';
+        if(!utr)return alert('Please enter the UTR / transaction reference.');
+        const r=await fetch('/api/payment/submit-reference',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId,utr,telegramChatId})});
+        const d=await r.json();alert(d.message||'Request submitted.');
+    }
+
     async function buyPkg(amount, coins) {
+        const paymentMethod=document.getElementById('payment-method-choice')?.value||'teknapay';
         const res = await fetch('/api/pay', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ telegramChatId, amount, coins })
+            body: JSON.stringify({ telegramChatId, amount, coins, paymentMethod })
         });
         const data = await res.json();
-        if(data.success && data.checkoutUrl) {
-            window.location.href = data.checkoutUrl;
-        } else {
-            alert('Error: ' + (data.message || 'Payment initialization failed'));
-        }
+        if(data.success && data.checkoutUrl) window.location.href = data.checkoutUrl;
+        else if(data.success && ['builtin','manual'].includes(data.paymentMethod)) showAlternativePayment(data);
+        else alert('Payment could not be started: ' + (data.message || 'Please try again.'));
     }
 
     async function openPassbook() {
@@ -674,5 +713,37 @@ function replyHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').
     };
 </script>
 <script src="/offers.js"></script>
+
+<script>
+(function(){
+  function applyBranding(b){
+    if(!b)return;
+    var name=String(b.siteName||'JPW');
+    if(name) document.title=document.title.replace(/JPW(?:\s+Admin)?/g,name);
+    document.querySelectorAll('.brand, .top-title, header, .logo-box').forEach(function(el){
+      var text=(el.textContent||'').trim();
+      if(/^(JPW(?:\s+Admin)?|JPW Reached Services|JPW Reach Services bot)$/.test(text)){
+        var span=el.querySelector('span:last-child');
+        if(span) span.textContent=name; else if(el.classList.contains('top-title')) el.firstChild.textContent=name;
+      }
+      if(b.logoUrl && (el.classList.contains('brand') || el.classList.contains('logo-box'))){
+        var img=el.querySelector('img[data-brand-logo]');
+        if(!img){img=document.createElement('img');img.setAttribute('data-brand-logo','1');img.alt=name+' logo';img.style.cssText='width:34px;height:34px;object-fit:contain;border-radius:8px;margin-right:8px';el.insertBefore(img,el.firstChild);}
+        img.src=b.logoUrl;
+      }
+    });
+    document.querySelectorAll('p,small,span').forEach(function(el){
+      if(el.children.length===0 && /^(©\s*2026\s*)?JPW Reached Services\. All rights reserved\.?$/.test((el.textContent||'').trim())) el.textContent='© '+new Date().getFullYear()+' '+name+'. All rights reserved.';
+    });
+    if(b.logoUrl){
+      var icon=document.querySelector('link[rel~="icon"]');
+      if(!icon){icon=document.createElement('link');icon.rel='icon';document.head.appendChild(icon);}
+      icon.href=b.logoUrl;
+    }
+  }
+  fetch('/api/public/branding',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(d&&d.success)applyBranding(d.branding)}).catch(function(){});
+})();
+</script>
+<footer id="tekna-global-footer" style="text-align:center;padding:14px 10px;color:#94a3b8;font-size:11px;">© 2026 TEKNA TECHNOLOGY. All Rights Reserved. · <a href="https://tikna.online" target="_blank" rel="noopener" style="color:#c4b5fd;text-decoration:none">tikna.online</a></footer>
 </body>
 </html>

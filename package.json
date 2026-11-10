@@ -1,11 +1,13 @@
 {
   "name": "jpw-root-bot",
-  "version": "2.12.0",
+  "version": "2.16.1",
   "description": "JPW Public Reach and Automation Bot System - Interactive Button Transfer & UX Edition",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "bot": "node bot.js"
+    "bot": "node bot.js",
+    "test": "node --test",
+    "setup:fresh": "node scripts/init-fresh-db.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",

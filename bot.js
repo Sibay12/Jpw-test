@@ -20,6 +20,26 @@ const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET;
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+// White-label message signature: pull the active site name from the server so Telegram
+// notifications follow Admin > Branding without hard-coded product names.
+let activeSiteBrand='JPW';
+let brandRefreshAt=0;
+const originalSendMessage=bot.sendMessage.bind(bot);
+bot.sendMessage=async function(chatId,text,options){
+    try{
+        if(Date.now()-brandRefreshAt>60000){
+            brandRefreshAt=Date.now();
+            const response=await fetch(`${MAIN_SERVER_URL.replace(/\/$/,'')}/api/public/branding`);
+            if(response.ok){const data=await response.json();if(data?.branding?.siteName)activeSiteBrand=String(data.branding.siteName).slice(0,60);}
+        }
+    }catch(e){}
+    const body=String(text??'');
+    const signature=`\\n\\n_${activeSiteBrand} · Powered by TEKNA TECHNOLOGY_`;
+    const finalText=body.includes('Powered by TEKNA TECHNOLOGY')?body:body+signature;
+    return originalSendMessage(chatId,finalText,options);
+};
+
+
 // temporary memory to track users currently entering their UPI ID for withdrawal
 const pendingUpiInput = new Set();
 
@@ -57,6 +77,7 @@ setInterval(async () => {
 }, 60 * 60 * 1000);
 
 bot.on('message', async (msg) => {
+    if (global.__JPW_LICENSE_ACTIVE !== true) return;
     if (!msg || !msg.chat || !msg.text) return;
     const chatId = String(msg.chat.id);
     const text = msg.text.trim();
@@ -334,6 +355,7 @@ async function sendBuyPlans(chatId) {
 }
 
 bot.on('callback_query', async (query) => {
+    if (global.__JPW_LICENSE_ACTIVE !== true) return;
     const chatId = String(query.message.chat.id);
     const messageId = query.message.message_id;
     const data = query.data;

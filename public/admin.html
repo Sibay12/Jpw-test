@@ -210,40 +210,71 @@
     }
 
     const gwDefaultRules = [
-        { id: 'success-default', enabled: true, keyword: 'status: success', matchMode: 'contains', classification: 'success_candidate', customerMessage: 'Your request for {targetId} has received a success update.', extractPattern: '', extractLabel: '' },
-        { id: 'failure-default', enabled: true, keyword: 'status: failed', matchMode: 'contains', classification: 'failure_candidate', customerMessage: 'There is an issue with your request for {targetId}. Our team will review it.', extractPattern: '', extractLabel: '' },
-        { id: 'progress-default', enabled: true, keyword: 'processing', matchMode: 'contains', classification: 'in_progress', customerMessage: 'Your request for {targetId} is currently being processed.', extractPattern: '', extractLabel: '' }
+        { id: 'success-default', enabled: true, channel: 'both', keyword: 'status: success', matchMode: 'contains', classification: 'success_candidate', customerMessage: 'Your request for {targetId} has received a success update.', approxTime: 0, extractPattern: '', extractLabel: '' },
+        { id: 'failure-default', enabled: true, channel: 'both', keyword: 'status: failed', matchMode: 'contains', classification: 'failure_candidate', customerMessage: 'There is an issue with your request for {targetId}. Our team will review it.', approxTime: 0, extractPattern: '', extractLabel: '' },
+        { id: 'progress-default', enabled: true, channel: 'both', keyword: 'processing', matchMode: 'contains', classification: 'in_progress', customerMessage: 'Your request for {targetId} is currently being processed.', approxTime: 0, extractPattern: '', extractLabel: '' }
     ];
+    let gwReplyRuleRows = [];
+    function gwRuleEsc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function gwRuleRow(rule = {}) {
+        const r = { enabled: true, channel: 'both', keyword: '', matchMode: 'contains', classification: 'in_progress', customerMessage: '', approxTime: 0, ...rule };
+        const id = gwRuleEsc(r.id || ('rule-' + (gwReplyRuleRows.length + 1)));
+        return `<div class="gw-rule-row card p-4 rounded-xl border border-slate-700/70 space-y-3" data-rule-id="${id}">
+          <div class="flex items-center justify-between gap-2"><label class="flex items-center gap-2 text-xs"><input class="gw-r-enabled" type="checkbox" ${r.enabled !== false ? 'checked' : ''}> Enable this rule</label><button type="button" class="btn btn-ghost btn-sm" onclick="gwRuleRemove(this)">Remove</button></div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <label class="text-xs text-slate-400">Channel<select class="fld gw-r-channel"><option value="both" ${r.channel==='both'?'selected':''}>WhatsApp + Telegram</option><option value="whatsapp" ${r.channel==='whatsapp'?'selected':''}>WhatsApp only</option><option value="telegram" ${r.channel==='telegram'?'selected':''}>Telegram only</option></select></label>
+            <label class="text-xs text-slate-400">Match type<select class="fld gw-r-match"><option value="contains" ${r.matchMode==='contains'?'selected':''}>Contains text</option><option value="exact" ${r.matchMode==='exact'?'selected':''}>Exact message</option><option value="regex" ${r.matchMode==='regex'?'selected':''}>Regular expression</option></select></label>
+            <label class="text-xs text-slate-400">Reply meaning<select class="fld gw-r-class"><option value="success_candidate" ${r.classification==='success_candidate'?'selected':''}>Completed / Success</option><option value="failure_candidate" ${r.classification==='failure_candidate'?'selected':''}>Failed / Rejected</option><option value="in_progress" ${r.classification==='in_progress'?'selected':''}>In Progress</option><option value="unclassified" ${r.classification==='unclassified'?'selected':''}>Other / Unclassified</option></select></label>
+          </div>
+          <label class="block text-xs text-slate-400">Incoming reply text / keyword<textarea class="fld gw-r-keyword" rows="2" placeholder="Paste the reply text or enter a phrase to detect">${gwRuleEsc(r.keyword)}</textarea></label>
+          <label class="block text-xs text-slate-400">Message to send to customer<textarea class="fld gw-r-customer" rows="2" placeholder="Write the customer message">${gwRuleEsc(r.customerMessage)}</textarea></label>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label class="text-xs text-slate-400">Approx. time (minutes)<input class="fld gw-r-time" type="number" min="0" max="10080" step="1" value="${Number(r.approxTime)||0}" placeholder="e.g. 10"></label>
+            <div class="text-xs text-slate-400"><span class="block mb-2">Target ID placeholder</span><button type="button" class="btn btn-ghost btn-sm" onclick="gwInsertTargetToken(this)">{targetId}</button><span class="block mt-2 text-[11px]">Click to insert the actual order Target ID into the customer message.</span></div>
+          </div>
+        </div>`;
+    }
+    function gwRuleAdd(rule = {}) {
+        if (document.querySelectorAll('#gwRulesForm .gw-rule-row').length >= 30) return alert('Maximum 30 rules allowed.');
+        const wrap = document.getElementById('gwRulesForm'); if (!wrap) return;
+        const box = document.createElement('div'); box.innerHTML = gwRuleRow(rule); wrap.appendChild(box.firstElementChild);
+    }
+    function gwRuleRemove(btn) { btn.closest('.gw-rule-row')?.remove(); }
+    function gwInsertTargetToken(btn) {
+        const area = btn.closest('.gw-rule-row')?.querySelector('.gw-r-customer'); if (!area) return;
+        const token = '{targetId}'; const a = area.selectionStart ?? area.value.length; const b = area.selectionEnd ?? area.value.length;
+        area.value = area.value.slice(0,a) + token + area.value.slice(b); area.focus(); area.setSelectionRange(a+token.length,a+token.length);
+    }
+    function gwRulesCollect() {
+        return [...document.querySelectorAll('#gwRulesForm .gw-rule-row')].map((el,i) => ({
+            id: el.dataset.ruleId || `rule-${i+1}`, enabled: el.querySelector('.gw-r-enabled').checked,
+            channel: el.querySelector('.gw-r-channel').value, matchMode: el.querySelector('.gw-r-match').value,
+            classification: el.querySelector('.gw-r-class').value, keyword: el.querySelector('.gw-r-keyword').value.trim(),
+            customerMessage: el.querySelector('.gw-r-customer').value.trim(), approxTime: Number(el.querySelector('.gw-r-time').value || 0)
+        })).filter(r => r.keyword);
+    }
     async function gwRulesLoad() {
         const msg = document.getElementById('gwRulesMessage');
         try {
             const r = await fetch('/api/admin/gateway-reply-rules', { headers: { 'x-admin-pass': adminPassCache }, cache: 'no-store' });
             const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Could not load reply rules');
-            const c = d.config || {};
-            document.getElementById('gwRulesEnabled').checked = c.enabled === true;
+            const c = d.config || {}; document.getElementById('gwRulesEnabled').checked = c.enabled === true;
             document.getElementById('gwNotifyCustomer').checked = c.notifyCustomer === true;
-            document.getElementById('gwRulesJson').value = JSON.stringify(Array.isArray(c.rules) ? c.rules : gwDefaultRules, null, 2);
+            const wrap = document.getElementById('gwRulesForm'); wrap.innerHTML = '';
+            (Array.isArray(c.rules) ? c.rules : gwDefaultRules).forEach(rule => gwRuleAdd(rule));
+            if (!wrap.children.length) gwRuleAdd();
             if (msg) msg.textContent = 'Reply rules loaded.';
         } catch (e) { if (msg) msg.textContent = e.message; }
     }
     async function gwRulesSave() {
         const msg = document.getElementById('gwRulesMessage');
         try {
-            const rules = JSON.parse(document.getElementById('gwRulesJson').value || '[]');
-            if (!Array.isArray(rules)) throw new Error('Reply rules must be a JSON array.');
-            const payload = {
-                enabled: document.getElementById('gwRulesEnabled').checked,
-                notifyCustomer: document.getElementById('gwNotifyCustomer').checked,
-                rules
-            };
-            const r = await fetch('/api/admin/gateway-reply-rules', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-admin-pass': adminPassCache },
-                body: JSON.stringify(payload)
-            });
+            const rules = gwRulesCollect();
+            if (!rules.length) throw new Error('Add at least one incoming reply rule.');
+            const payload = { enabled: document.getElementById('gwRulesEnabled').checked, notifyCustomer: document.getElementById('gwNotifyCustomer').checked, rules };
+            const r = await fetch('/api/admin/gateway-reply-rules', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-admin-pass': adminPassCache }, body: JSON.stringify(payload) });
             const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.message || 'Save failed');
-            document.getElementById('gwRulesJson').value = JSON.stringify(d.config.rules || [], null, 2);
-            if (msg) msg.textContent = 'Saved successfully. ' + (d.message || '');
+            await gwRulesLoad(); if (msg) msg.textContent = 'Saved successfully. ' + (d.message || '');
         } catch (e) { if (msg) msg.textContent = 'Error: ' + e.message; }
     }
 </script>
@@ -893,6 +924,71 @@
     </div>
 </section>
 <section data-tab="settings" class="hidden space-y-4">
+    <div class="card p-6 rounded-2xl">
+      <h3 class="text-base font-bold text-emerald-300 mb-1">Three Payment Methods</h3>
+      <p class="text-xs text-slate-400 mb-4">Enable the payment options customers can use. Built-in and manual payments stay pending until verified.</p>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+        <label class="flex items-center gap-2 p-3 rounded-xl bg-slate-900 border border-slate-700"><input type="checkbox" id="pmTeknapay" checked> TEKNAPAY Gateway</label>
+        <label class="flex items-center gap-2 p-3 rounded-xl bg-slate-900 border border-slate-700"><input type="checkbox" id="pmBuiltin"> Built-in UPI QR</label>
+        <label class="flex items-center gap-2 p-3 rounded-xl bg-slate-900 border border-slate-700"><input type="checkbox" id="pmManual"> Manual Payment</label>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+        <div class="space-y-2 p-3 rounded-xl border border-slate-700">
+          <b class="text-xs text-slate-200">Built-in UPI</b>
+          <input id="pmBuiltinUpi" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs" placeholder="merchant@bank">
+          <input id="pmBuiltinName" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs" placeholder="Merchant display name">
+          <input id="pmBuiltinNote" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs" placeholder="Payment note">
+        </div>
+        <div class="space-y-2 p-3 rounded-xl border border-slate-700">
+          <b class="text-xs text-slate-200">Manual Payment</b>
+          <input id="pmManualUpi" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs" placeholder="manual@bank">
+          <input id="pmManualName" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs" placeholder="Account / Merchant name">
+          <textarea id="pmManualInstructions" rows="3" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs" placeholder="Payment instructions for customer"></textarea>
+        </div>
+      </div>
+      <p id="pmStatus" class="text-xs text-slate-400 mt-3"></p>
+      <button onclick="pmSave()" class="w-full mt-3 py-3 bg-emerald-600 text-slate-950 font-extrabold rounded-xl text-xs">SAVE PAYMENT METHODS</button>
+    </div>
+
+
+
+    <div class="card p-6 rounded-2xl">
+      <div class="flex items-center justify-between gap-3 flex-wrap">
+        <div><h3 class="text-base font-bold text-amber-300">Payment Review & Audit</h3><p class="text-xs text-slate-400">Review submitted UTRs. Approval changes payment status; customer balance is credited through the existing verification flow.</p></div>
+        <button onclick="loadPaymentReviews()" class="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-bold">REFRESH</button>
+      </div>
+      <div id="paymentReviewList" class="space-y-3 mt-4 text-xs"><p class="text-slate-500">Press Refresh to load pending payments.</p></div>
+    </div>
+
+    <!-- White-label branding -->
+    <div class="card p-6 rounded-2xl">
+        <div class="flex items-center justify-between gap-3 flex-wrap mb-4">
+            <div><h3 class="text-base font-bold text-indigo-300">Website Branding / White Label</h3>
+            <p class="text-xs text-slate-400 mt-1">Change the website name, tagline and logo for this installation.</p></div>
+            <span id="brandEnvState" class="text-[10px] text-slate-400"></span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div><label class="block text-[10px] text-slate-400 mb-1">Website / Product Name</label>
+                <input id="brandSiteName" maxlength="60" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-sm text-indigo-100" placeholder="Your brand name"></div>
+            <div><label class="block text-[10px] text-slate-400 mb-1">Tagline (optional)</label>
+                <input id="brandTagline" maxlength="120" class="w-full p-3 rounded-xl bg-slate-900 border border-slate-700 text-sm text-indigo-100" placeholder="Your website tagline"></div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3 items-center">
+            <div><label class="block text-[10px] text-slate-400 mb-1">Upload Logo (PNG, JPG, WebP — max 1 MB)</label>
+                <input id="brandLogoFile" type="file" accept="image/png,image/jpeg,image/webp" class="w-full p-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-300">
+                <input id="brandLogoUrl" class="w-full mt-2 p-3 rounded-xl bg-slate-900 border border-slate-700 text-xs text-indigo-100" placeholder="Or paste HTTPS logo URL">
+                <button type="button" onclick="brandClearLogo()" class="text-[10px] text-rose-300 underline mt-2">Remove logo</button>
+            </div>
+            <div class="flex items-center gap-3 p-3 rounded-xl bg-slate-900 border border-slate-700">
+                <div class="w-16 h-16 rounded-xl bg-slate-800 flex items-center justify-center overflow-hidden"><img id="brandLogoPreview" alt="Logo preview" class="max-w-full max-h-full object-contain hidden"><span id="brandLogoEmpty" class="text-2xl">🏷️</span></div>
+                <div><div class="text-xs font-bold text-slate-200">Logo Preview</div><div class="text-[10px] text-slate-500">Shown on supported portal headers and browser tab.</div></div>
+            </div>
+        </div>
+        <p id="brandStatus" class="text-xs text-slate-400 mt-3"></p>
+        <button id="brandSaveBtn" onclick="brandSave()" class="w-full mt-3 py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold rounded-xl text-xs">SAVE BRANDING</button>
+        <p class="text-[10px] text-slate-500 mt-3">Environment variables: SITE_NAME, SITE_TAGLINE, SITE_LOGO_URL. Set BRANDING_ENV_LOCK=true to prevent Admin Panel overrides.</p>
+    </div>
+
     <!-- 🛠️ Maintenance Mode -->
     <div class="card p-6 rounded-2xl">
         <h3 class="text-base font-bold text-rose-400   mb-1 text-center">Maintenance Mode</h3>
@@ -1015,21 +1111,20 @@
     <div class="card p-5 rounded-2xl space-y-4 mt-4">
         <div class="flex items-center justify-between gap-3 flex-wrap">
             <div><h3 class="font-bold text-sm">Phase 3 — Reply Rules & Customer Status Messages</h3>
-            <p class="text-xs text-slate-400 mt-1">Configure exact/contains matching, classification, optional field extraction and customer message templates.</p></div>
+            <p class="text-xs text-slate-400 mt-1">Create simple WhatsApp and Telegram reply filters with customer message templates and approximate time.</p></div>
             <button class="btn btn-ghost btn-sm" onclick="gwRulesLoad()">Load rules</button>
         </div>
         <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwRulesEnabled"> Enable configurable reply rules</label>
-        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwNotifyCustomer"> Send configured status messages to the customer via Telegram</label>
+        <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="gwNotifyCustomer"> Send the configured customer message when a rule matches</label>
         <p class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3">Customer notifications are OFF by default. Rules only classify and annotate replies; they do not automatically approve payments or complete/reject orders. Test rules before enabling customer messages.</p>
-        <div>
-            <label class="text-xs text-slate-400 block mb-1">Reply rules (JSON)</label>
-            <textarea id="gwRulesJson" class="fld font-mono text-xs" rows="13" spellcheck="false"></textarea>
-            <p class="text-[11px] text-slate-400 mt-2">Fields: id, enabled, keyword, matchMode (exact/contains), classification (success_candidate/failure_candidate/in_progress/unclassified), customerMessage, extractPattern (optional JavaScript regular expression), extractLabel. Templates support {targetId}, {status} and {extracted}. First matching enabled rule wins.</p>
-        </div>
+        <div class="rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-3 text-xs text-slate-300">Paste or type the incoming WhatsApp/Telegram reply, choose how it should be detected, then write the customer message. First matching enabled rule wins. This filter labels replies and sends the configured notice; it does not by itself approve payments or change order status.</div>
+        <div id="gwRulesForm" class="space-y-3"></div>
         <div class="flex gap-2 flex-wrap">
-            <button class="btn btn-primary btn-sm" onclick="gwRulesSave()">Save Reply Rules</button>
-            <button class="btn btn-ghost btn-sm" onclick="gwRulesLoad()">Reload Rules</button>
+            <button class="btn btn-ghost btn-sm" onclick="gwRuleAdd()">＋ Add More</button>
+            <button class="btn btn-primary btn-sm" onclick="gwRulesSave()">Save Rules</button>
+            <button class="btn btn-ghost btn-sm" onclick="gwRulesLoad()">Reload</button>
         </div>
+        <p class="text-[11px] text-slate-400">Use <code>{targetId}</code> in the customer message wherever the real Target ID should appear. Use <code>{status}</code> for the detected status, <code>{extracted}</code> for extracted text, and <code>{approxTime}</code> for the approximate time in minutes. Set Approx. time to 0 to omit it.</p>
         <p id="gwRulesMessage" class="text-xs text-slate-400"></p>
     </div>
 </section>
@@ -1906,6 +2001,7 @@
         if (name === 'logs') logsOpen(); else logsStop();
         if (name === 'offers') { offOpen(); rpLoad(); } else offStopPoll();
         if (name === 'connections') sheetLoad();
+        if (name === 'settings') { brandLoad(); pmLoad(); }
         if (name === 'gateways') { gwLoad(); gwRepliesLoad(); }
         if (name === 'selected') selOpen(); else selStop();
         if (name === 'overview') setTimeout(renderOverviewChart, 30);
@@ -2400,6 +2496,149 @@
     let ovResizeT = null;
     window.addEventListener('resize', () => { clearTimeout(ovResizeT); ovResizeT = setTimeout(renderOverviewChart, 150); });
     (function initLook() { let t = 'dark'; try { t = localStorage.getItem('jpwTheme') || 'dark'; } catch (e) {} setTheme(t); })();
+
+    let brandCurrentLogo = '';
+    async function brandLoad() {
+        const status = document.getElementById('brandStatus');
+        try {
+            const r = await fetch('/api/admin/branding', { headers: { 'x-admin-pass': adminPassCache } });
+            const d = await r.json();
+            if (!d.success) throw new Error(d.message || 'Could not load branding');
+            const b = d.branding || {};
+            document.getElementById('brandSiteName').value = b.siteName || '';
+            document.getElementById('brandTagline').value = b.tagline || '';
+            brandCurrentLogo = b.logoUrl || '';
+            document.getElementById('brandLogoUrl').value = /^https:\/\//i.test(brandCurrentLogo) ? brandCurrentLogo : '';
+            brandPreview(brandCurrentLogo);
+            document.getElementById('brandEnvState').textContent = b.envLocked ? 'Locked by environment' : (b.envConfigured ? 'Environment defaults configured' : 'Admin editable');
+            document.getElementById('brandSaveBtn').disabled = !!b.envLocked;
+            if (b.envLocked) status.textContent = 'Branding is locked by BRANDING_ENV_LOCK=true. Change Render environment variables to update it.';
+        } catch (e) { if (status) status.textContent = e.message; }
+    }
+    function brandPreview(src) {
+        const img = document.getElementById('brandLogoPreview'), empty = document.getElementById('brandLogoEmpty');
+        if (src) { img.src = src; img.classList.remove('hidden'); empty.classList.add('hidden'); }
+        else { img.removeAttribute('src'); img.classList.add('hidden'); empty.classList.remove('hidden'); }
+    }
+    function brandClearLogo() {
+        brandCurrentLogo = '';
+        document.getElementById('brandLogoUrl').value = '';
+        document.getElementById('brandLogoFile').value = '';
+        brandPreview('');
+    }
+    document.getElementById('brandLogoFile')?.addEventListener('change', function () {
+        const file = this.files && this.files[0];
+        if (!file) return;
+        if (!['image/png','image/jpeg','image/webp'].includes(file.type) || file.size > 1024 * 1024) {
+            alert('Choose PNG, JPG or WebP up to 1 MB.'); this.value = ''; return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => { brandCurrentLogo = String(reader.result || ''); document.getElementById('brandLogoUrl').value = ''; brandPreview(brandCurrentLogo); };
+        reader.readAsDataURL(file);
+    });
+    document.getElementById('brandLogoUrl')?.addEventListener('input', function () {
+        if (this.value.trim()) { brandCurrentLogo = this.value.trim(); brandPreview(brandCurrentLogo); }
+    });
+    async function brandSave() {
+        const status = document.getElementById('brandStatus'), btn = document.getElementById('brandSaveBtn');
+        const payload = {
+            siteName: document.getElementById('brandSiteName').value.trim(),
+            tagline: document.getElementById('brandTagline').value.trim(),
+            logoUrl: document.getElementById('brandLogoUrl').value.trim() || brandCurrentLogo
+        };
+        if (!payload.siteName) { status.textContent = 'Website name is required.'; return; }
+        btn.disabled = true; status.textContent = 'Saving...';
+        try {
+            const r = await fetch('/api/admin/branding', { method: 'POST', headers: { 'x-admin-pass': adminPassCache, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            const d = await r.json();
+            if (!d.success) throw new Error(d.message || 'Save failed');
+            status.textContent = 'Branding saved. Refresh portal pages to see the new name and logo.';
+            brandCurrentLogo = (d.branding && d.branding.logoUrl) || '';
+            brandPreview(brandCurrentLogo);
+        } catch (e) { status.textContent = e.message; }
+        finally { btn.disabled = false; }
+    }
 </script>
+
+<script>
+(function(){
+  function applyBranding(b){
+    if(!b)return;
+    var name=String(b.siteName||'JPW');
+    if(name) document.title=document.title.replace(/JPW(?:\s+Admin)?/g,name);
+    document.querySelectorAll('.brand, .top-title, header, .logo-box').forEach(function(el){
+      var text=(el.textContent||'').trim();
+      if(/^(JPW(?:\s+Admin)?|JPW Reached Services|JPW Reach Services bot)$/.test(text)){
+        var span=el.querySelector('span:last-child');
+        if(span) span.textContent=name; else if(el.classList.contains('top-title')) el.firstChild.textContent=name;
+      }
+      if(b.logoUrl && (el.classList.contains('brand') || el.classList.contains('logo-box'))){
+        var img=el.querySelector('img[data-brand-logo]');
+        if(!img){img=document.createElement('img');img.setAttribute('data-brand-logo','1');img.alt=name+' logo';img.style.cssText='width:34px;height:34px;object-fit:contain;border-radius:8px;margin-right:8px';el.insertBefore(img,el.firstChild);}
+        img.src=b.logoUrl;
+      }
+    });
+    document.querySelectorAll('p,small,span').forEach(function(el){
+      if(el.children.length===0 && /^(©\s*2026\s*)?JPW Reached Services\. All rights reserved\.?$/.test((el.textContent||'').trim())) el.textContent='© '+new Date().getFullYear()+' '+name+'. All rights reserved.';
+    });
+    if(b.logoUrl){
+      var icon=document.querySelector('link[rel~="icon"]');
+      if(!icon){icon=document.createElement('link');icon.rel='icon';document.head.appendChild(icon);}
+      icon.href=b.logoUrl;
+    }
+  }
+  fetch('/api/public/branding',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(d&&d.success)applyBranding(d.branding)}).catch(function(){});
+})();
+
+    async function pmLoad(){
+      const st=document.getElementById('pmStatus');
+      try{
+        const r=await fetch('/api/admin/payment-methods',{headers:{'x-admin-pass':adminPassCache},cache:'no-store'});
+        const d=await r.json();if(!d.success)throw new Error(d.message||'Load failed');
+        const c=d.config||{},e=c.enabled||{},b=c.builtin||{},m=c.manual||{};
+        document.getElementById('pmTeknapay').checked=e.teknapay!==false;
+        document.getElementById('pmBuiltin').checked=!!e.builtin;document.getElementById('pmManual').checked=!!e.manual;
+        document.getElementById('pmBuiltinUpi').value=b.upiId||'';document.getElementById('pmBuiltinName').value=b.merchantName||'';
+        document.getElementById('pmBuiltinNote').value=b.note||'';
+        document.getElementById('pmManualUpi').value=m.upiId||'';document.getElementById('pmManualName').value=m.accountName||'';
+        document.getElementById('pmManualInstructions').value=m.instructions||'';
+      }catch(e){st.textContent=e.message;}
+    }
+    async function pmSave(){
+      const st=document.getElementById('pmStatus');st.textContent='Saving...';
+      const payload={enabled:{teknapay:document.getElementById('pmTeknapay').checked,builtin:document.getElementById('pmBuiltin').checked,manual:document.getElementById('pmManual').checked},
+       builtin:{upiId:document.getElementById('pmBuiltinUpi').value,merchantName:document.getElementById('pmBuiltinName').value,note:document.getElementById('pmBuiltinNote').value},
+       manual:{upiId:document.getElementById('pmManualUpi').value,accountName:document.getElementById('pmManualName').value,instructions:document.getElementById('pmManualInstructions').value}};
+      try{const r=await fetch('/api/admin/payment-methods',{method:'POST',headers:{'x-admin-pass':adminPassCache,'Content-Type':'application/json'},body:JSON.stringify(payload)});
+       const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Save failed');st.textContent='Payment methods saved.';}
+      catch(e){st.textContent=e.message;}
+    }
+
+    async function loadPaymentReviews(){
+      const box=document.getElementById('paymentReviewList');box.innerHTML='<p class="text-slate-400">Loading payments…</p>';
+      try{
+        const r=await fetch('/api/admin/payment-reviews?status=PENDING',{headers:{'x-admin-pass':adminPassCache},cache:'no-store'});
+        const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Unable to load payment reviews');
+        if(!d.payments.length){box.innerHTML='<p class="text-emerald-300">No pending payments.</p>';return;}
+        box.innerHTML=d.payments.map(p=>`<div class="p-4 rounded-xl bg-slate-900 border border-slate-700 space-y-2">
+          <div class="flex justify-between gap-2"><b class="text-slate-100">${p.orderId}</b><b class="text-amber-300">₹${Number(p.amount||0).toFixed(2)}</b></div>
+          <div class="text-slate-400">Method: ${p.paymentMethod||'teknapay'} · Customer: ${p.telegramChatId||'—'} · Coins: ${p.coins||0}</div>
+          <div class="text-slate-300">UTR: <b>${p.utr||'Not submitted'}</b></div>
+          <div class="text-slate-500">Created: ${p.createdAt?new Date(p.createdAt).toLocaleString():''}</div>
+          <div class="flex gap-2"><button onclick="reviewPayment('${p.orderId}','approve')" class="px-3 py-2 rounded-lg bg-emerald-600 text-white font-bold">APPROVE</button><button onclick="reviewPayment('${p.orderId}','reject')" class="px-3 py-2 rounded-lg bg-rose-700 text-white font-bold">REJECT</button></div>
+        </div>`).join('');
+      }catch(e){box.innerHTML='<p class="text-rose-300">'+e.message+'</p>';}
+    }
+    async function reviewPayment(orderId,action){
+      const reason=action==='reject'?prompt('Reason for rejection (optional):')||'':'';
+      if(!confirm((action==='approve'?'Approve':'Reject')+' payment '+orderId+'?'))return;
+      try{
+        const r=await fetch('/api/admin/payment-reviews/action',{method:'POST',headers:{'x-admin-pass':adminPassCache,'Content-Type':'application/json'},body:JSON.stringify({orderId,action,reason})});
+        const d=await r.json();if(!r.ok||!d.success)throw new Error(d.message||'Action failed');
+        alert(d.message);loadPaymentReviews();
+      }catch(e){alert(e.message);}
+    }
+</script>
+<footer id="tekna-global-footer" style="text-align:center;padding:14px 10px;color:#94a3b8;font-size:11px;">© 2026 TEKNA TECHNOLOGY. All Rights Reserved. · <a href="https://tikna.online" target="_blank" rel="noopener" style="color:#c4b5fd;text-decoration:none">tikna.online</a></footer>
 </body>
 </html>

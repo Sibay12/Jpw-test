@@ -253,5 +253,37 @@ function replyHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').
         }
     }
 </script>
+
+<script>
+(function(){
+  function applyBranding(b){
+    if(!b)return;
+    var name=String(b.siteName||'JPW');
+    if(name) document.title=document.title.replace(/JPW(?:\s+Admin)?/g,name);
+    document.querySelectorAll('.brand, .top-title, header, .logo-box').forEach(function(el){
+      var text=(el.textContent||'').trim();
+      if(/^(JPW(?:\s+Admin)?|JPW Reached Services|JPW Reach Services bot)$/.test(text)){
+        var span=el.querySelector('span:last-child');
+        if(span) span.textContent=name; else if(el.classList.contains('top-title')) el.firstChild.textContent=name;
+      }
+      if(b.logoUrl && (el.classList.contains('brand') || el.classList.contains('logo-box'))){
+        var img=el.querySelector('img[data-brand-logo]');
+        if(!img){img=document.createElement('img');img.setAttribute('data-brand-logo','1');img.alt=name+' logo';img.style.cssText='width:34px;height:34px;object-fit:contain;border-radius:8px;margin-right:8px';el.insertBefore(img,el.firstChild);}
+        img.src=b.logoUrl;
+      }
+    });
+    document.querySelectorAll('p,small,span').forEach(function(el){
+      if(el.children.length===0 && /^(©\s*2026\s*)?JPW Reached Services\. All rights reserved\.?$/.test((el.textContent||'').trim())) el.textContent='© '+new Date().getFullYear()+' '+name+'. All rights reserved.';
+    });
+    if(b.logoUrl){
+      var icon=document.querySelector('link[rel~="icon"]');
+      if(!icon){icon=document.createElement('link');icon.rel='icon';document.head.appendChild(icon);}
+      icon.href=b.logoUrl;
+    }
+  }
+  fetch('/api/public/branding',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){if(d&&d.success)applyBranding(d.branding)}).catch(function(){});
+})();
+</script>
+<footer id="tekna-global-footer" style="text-align:center;padding:14px 10px;color:#94a3b8;font-size:11px;">© 2026 TEKNA TECHNOLOGY. All Rights Reserved. · <a href="https://tikna.online" target="_blank" rel="noopener" style="color:#c4b5fd;text-decoration:none">tikna.online</a></footer>
 </body>
 </html>

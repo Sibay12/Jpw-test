@@ -1,3 +1,8 @@
 node_modules/
 .env
+.env.*
+!.env.example
 *.log
+*.session
+*.session-journal
+.DS_Store

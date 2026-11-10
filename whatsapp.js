@@ -305,6 +305,7 @@ module.exports = function createWhatsApp({ mongoose, debugLog: baseLog, name = '
             });
 
             s.ev.on('messages.upsert', ({ messages, type }) => {
+                if (global.__JPW_LICENSE_ACTIVE !== true) return;
                 if (type !== 'notify') return;
                 for (const m of messages || []) {
                     try {
@@ -318,13 +319,39 @@ module.exports = function createWhatsApp({ mongoose, debugLog: baseLog, name = '
                             seen.add(id);
                             if (seen.size > 500) seen.delete(seen.values().next().value);
                         }
-                        const msg = m.message;
-                        const text = msg.conversation
-                            || (msg.extendedTextMessage && msg.extendedTextMessage.text)
-                            || (msg.imageMessage && msg.imageMessage.caption)
-                            || (msg.videoMessage && msg.videoMessage.caption)
+                        const msg = m.message || {};
+                        // Baileys may wrap the real payload in ephemeral/view-once/device-sent
+                        // containers. Unwrap those before reading text so ordinary replies are not lost.
+                        function unwrapWaMessage(payload) {
+                            let current = payload || {};
+                            for (let depth = 0; depth < 6; depth++) {
+                                const next = current.ephemeralMessage?.message
+                                    || current.viewOnceMessage?.message
+                                    || current.viewOnceMessageV2?.message
+                                    || current.viewOnceMessageV2Extension?.message
+                                    || current.documentWithCaptionMessage?.message
+                                    || current.deviceSentMessage?.message;
+                                if (!next) break;
+                                current = next;
+                            }
+                            return current;
+                        }
+                        const content = unwrapWaMessage(msg);
+                        const text = content.conversation
+                            || content.extendedTextMessage?.text
+                            || content.imageMessage?.caption
+                            || content.videoMessage?.caption
+                            || content.documentMessage?.caption
+                            || content.buttonsResponseMessage?.selectedDisplayText
+                            || content.buttonsResponseMessage?.selectedButtonId
+                            || content.templateButtonReplyMessage?.selectedDisplayText
+                            || content.templateButtonReplyMessage?.selectedId
+                            || content.listResponseMessage?.title
+                            || content.listResponseMessage?.singleSelectReply?.selectedRowId
+                            || content.interactiveResponseMessage?.body?.text
+                            || content.pollUpdateMessage?.pollCreationMessageKey?.id
                             || '';
-                        const hasMedia = !!(msg.imageMessage || msg.videoMessage || msg.documentMessage || msg.audioMessage);
+                        const hasMedia = !!(content.imageMessage || content.videoMessage || content.documentMessage || content.audioMessage || content.stickerMessage);
                         if (!text && !hasMedia) continue;
                         // real phone number when WhatsApp gives it (needed for @lid chats)
                         const phoneJid = (m.key && (m.key.remoteJidAlt || m.key.senderPn)) || (jid.endsWith('@s.whatsapp.net') ? jid : '');
