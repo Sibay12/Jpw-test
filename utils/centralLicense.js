@@ -5,7 +5,7 @@ const { encryptSensitive, decryptSensitive } = require('./fieldEncryption');
 
 // Fixed product endpoint/configuration. These are identifiers, not secrets.
 // Keep this file server-side; do not expose it through static/public assets.
-const API_BASE = 'https://license.takna.online/api/v1';
+const API_BASE = 'http://license.takna.online/api/v1';
 const PRODUCT_CODE = 'JPW';
 const VERIFY_INTERVAL_MS = Math.max(60_000, Number(process.env.LICENSE_VERIFY_INTERVAL_MS || 6 * 60 * 60 * 1000));
 const REQUEST_TIMEOUT_MS = 15_000;
