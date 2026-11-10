@@ -19,7 +19,7 @@ function getDomain(req) {
 }
 function assertConfig() {
   const u = new URL(API_BASE);
-  if (u.protocol !== 'https:') throw new Error('Central license API must use HTTPS.');
+  if (u.protocol !== 'http:') throw new Error('Central license API must use HTTP.');
   if (!/^[A-Z0-9_-]{2,40}$/.test(PRODUCT_CODE)) throw new Error('Built-in license product code is invalid.');
 }
 async function callCentral(path, payload) {
@@ -45,7 +45,7 @@ async function callCentral(path, payload) {
       const cause = causeCode ? ` (${causeCode})` : '';
       const detail = controller.signal.aborted
         ? `Central license server timed out after ${REQUEST_TIMEOUT_MS} ms.`
-        : `Cannot connect to Central License Server at ${new URL(API_BASE).host}${cause}. Check Render outbound network, DNS and the portal's HTTPS certificate.`;
+        : `Cannot connect to Central License Server at ${new URL(API_BASE).host}${cause}. Check Render outbound network, DNS and the portal's HTTP certificate.`;
       const err = new Error(detail);
       err.code = causeCode || (controller.signal.aborted ? 'ETIMEDOUT' : 'ECONNECT');
       err.cause = networkError;
@@ -58,7 +58,7 @@ async function callCentral(path, payload) {
       throw new Error(`Central License Server returned non-JSON response (HTTP ${response.status}). Check PHP endpoint and hosting rewrite configuration.`);
     }
     if (!response.ok || data.success !== true || data.active !== true || data.status !== 'ACTIVE') {
-      const message = String(data.message || `Central license server rejected the request (HTTP ${response.status}).`).slice(0, 300);
+      const message = String(data.message || `Central license server rejected the request (HTTPS ${response.status}).`).slice(0, 300);
       const err = new Error(message); err.statusCode = response.status; err.centralStatus = data.status || 'UNVERIFIED'; throw err;
     }
     // The deployed central v1 API returns license.features; an empty list is
